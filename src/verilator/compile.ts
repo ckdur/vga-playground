@@ -1,4 +1,4 @@
-import { VerilogXMLParser } from '../sim/vxmlparser';
+import { VerilogJSONParser } from '../sim/vxmlparser';
 import { ErrorParser } from './ErrorParser';
 import verilator_bin from './verilator_bin';
 import verilated_std_waiver_vlt from './verilated_std_waiver.vlt?raw';
@@ -38,6 +38,8 @@ export async function compileVerilator(opts: ICompileOptions) {
   const { FS } = verilatorInst;
 
   let sourceList: string[] = [];
+  let cwd = FS.cwd()
+  console.log(cwd)
   FS.mkdir('src');
   FS.mkdir('/share');
   FS.mkdir('/share/verilator');
@@ -52,7 +54,9 @@ export async function compileVerilator(opts: ICompileOptions) {
       sourceList.push(path);
     }
   }
-  const xmlPath = `obj_dir/V${opts.topModule}.xml`;
+  var contents = FS.readdir('/');
+  console.log(contents)
+  const jsonPath = `obj_dir/V${opts.topModule}.tree.json`;
   try {
     const args = [
       '--cc',
@@ -61,7 +65,7 @@ export async function compileVerilator(opts: ICompileOptions) {
       '-Wno-EOFNEWLINE',
       '-Wno-DECLFILENAME', 
       // Why do you even care?
-      '-Wno-UNOPTFLAT', '-Wno-BLKSEQ', '-Wno-UNDRIVEN', '-Wno-PINMISSING', '-Wno-UNUSED',
+      '-Wno-UNOPTFLAT', '-Wno-BLKSEQ', '-Wno-UNDRIVEN', '-Wno-PINMISSING', '-Wno-UNUSED', '-Wno-WIDTHTRUNC',
       '--x-assign',
       'fast',
       '--debug-check', // for XML output
@@ -111,11 +115,11 @@ export async function compileVerilator(opts: ICompileOptions) {
     window.URL.revokeObjectURL(url);
   }
 
-  const xmlParser = new VerilogXMLParser();
+  const jsonParser = new VerilogJSONParser();
   try {
-    const xmlContent = FS.readFile(xmlPath, { encoding: 'utf8' });
+    const jsonContent = FS.readFile(jsonPath, { encoding: 'utf8' });
     //downloadRawFile(xmlContent, `V${opts.topModule}.xml`);
-    xmlParser.parse(xmlContent);
+    jsonParser.parse(jsonContent);
   } catch (e) {
     console.log(e, (e as Error).stack);
 
@@ -134,6 +138,6 @@ export async function compileVerilator(opts: ICompileOptions) {
   }
   return {
     errors: errorParser.errors,
-    output: xmlParser,
+    output: jsonParser,
   };
 }

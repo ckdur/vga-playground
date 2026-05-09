@@ -30,7 +30,7 @@ import {
   isConstExpr,
   isVarDecl,
 } from './hdltypes';
-import { parseXMLPoorly, XMLNode } from './xml';
+import { parseJSONPoorly, JSONNode } from './json';
 
 /**
  * Whaa?
@@ -56,13 +56,13 @@ export class CompileError extends Error implements HDLSourceObject {
   }
 }
 
-export class VerilogXMLParser implements HDLUnit {
+export class VerilogJSONParser implements HDLUnit {
   files: { [id: string]: HDLFile } = {};
   dtypes: { [id: string]: HDLDataType } = {};
   modules: { [id: string]: HDLModuleDef } = {};
   hierarchies: { [id: string]: HDLHierarchyDef } = {};
 
-  cur_node!: XMLNode;
+  cur_node!: JSONNode;
   cur_module!: HDLModuleDef;
   cur_loc!: HDLSourceLocation;
   cur_loc_str!: string;
@@ -100,23 +100,25 @@ export class VerilogXMLParser implements HDLUnit {
     return s.replace(/[^a-z0-9_]/gi, '$');
   }
 
-  findChildren(node: XMLNode, type: string, required: boolean): XMLNode[] {
+  findChildren(node: JSONNode, type: string, required: boolean): JSONNode[] {
     const arr = node.children.filter((n) => n.type == type);
     if (arr.length == 0 && required)
       throw new CompileError(this.cur_loc, `no child of type ${type}`);
     return arr;
   }
 
-  parseSourceLocation(node: XMLNode): HDLSourceLocation | undefined {
+  parseSourceLocation(node: JSONNode): HDLSourceLocation | undefined {
     const loc = node.attrs['loc'];
     if (loc) {
       if (loc == this.cur_loc_str) {
         return this.cur_loc; // cache last parsed $loc object
       } else {
         const [fileid, line, col, end_line, end_col] = loc.split(',');
+        const file = this.files[fileid] ?? fileid
+        const filename = file.filename ?? fileid
         const $loc = {
-          hdlfile: this.files[fileid],
-          path: this.files[fileid].filename,
+          hdlfile: file,
+          path: filename,
           line: parseInt(line),
           start: parseInt(col) - 1,
           end_line: parseInt(end_line),
@@ -131,7 +133,7 @@ export class VerilogXMLParser implements HDLUnit {
     }
   }
 
-  open_module(node: XMLNode) {
+  open_module(node: JSONNode) {
     const module: HDLModuleDef = {
       $loc: this.parseSourceLocation(node),
       name: node.attrs['name'],
@@ -145,7 +147,7 @@ export class VerilogXMLParser implements HDLUnit {
     return module;
   }
 
-  deferDataType(node: XMLNode, def: HDLDataTypeObject) {
+  deferDataType(node: JSONNode, def: HDLDataTypeObject) {
     const dtype_id = node.attrs['dtype_id'];
     if (dtype_id != null) {
       this.defer(() => {
@@ -186,13 +188,13 @@ export class VerilogXMLParser implements HDLUnit {
 
   //
 
-  visit_verilator_xml(node: XMLNode) {}
+  visit_verilator_xml(node: JSONNode) {}
 
-  visit_package(node: XMLNode) {
+  visit_package(node: JSONNode) {
     // TODO?
   }
 
-  visit_module(node: XMLNode) {
+  visit_module(node: JSONNode) {
     this.findChildren(node, 'var', false).forEach((n) => {
       if (isVarDecl(n.obj)) {
         this.cur_module.vardefs[n.obj.name] = n.obj;
@@ -202,7 +204,7 @@ export class VerilogXMLParser implements HDLUnit {
     this.cur_module = null!;
   }
 
-  visit_var(node: XMLNode): HDLVariableDef {
+  visit_var(node: JSONNode): HDLVariableDef {
     let name = node.attrs['name'];
     name = this.name2js(name);
     const vardef: HDLVariableDef = {
@@ -226,7 +228,7 @@ export class VerilogXMLParser implements HDLUnit {
     return vardef;
   }
 
-  visit_const(node: XMLNode): HDLConstant {
+  visit_const(node: JSONNode): HDLConstant {
     const name = node.attrs['name'];
     const { value, origWidth } = this.parseConstValue(name);
     const constdef: HDLConstant = {
@@ -240,7 +242,7 @@ export class VerilogXMLParser implements HDLUnit {
     return constdef;
   }
 
-  visit_varref(node: XMLNode): HDLVarRef {
+  visit_varref(node: JSONNode): HDLVarRef {
     let name = node.attrs['name'];
     name = this.name2js(name);
     const varref: HDLVarRef = {
@@ -258,11 +260,11 @@ export class VerilogXMLParser implements HDLUnit {
     return varref;
   }
 
-  visit_sentree(node: XMLNode) {
+  visit_sentree(node: JSONNode) {
     // TODO
   }
 
-  visit_always(node: XMLNode): HDLAlwaysBlock {
+  visit_always(node: JSONNode): HDLAlwaysBlock {
     // TODO
     let sentree: HDLSensItem[] | null;
     let expr: HDLExpr;
@@ -285,7 +287,7 @@ export class VerilogXMLParser implements HDLUnit {
     return always;
   }
 
-  visit_begin(node: XMLNode): HDLBlock {
+  visit_begin(node: JSONNode): HDLBlock {
     const exprs: HDLExpr[] = [];
     node.children.forEach((n) => exprs.push(n.obj));
     return {
@@ -296,11 +298,11 @@ export class VerilogXMLParser implements HDLUnit {
     };
   }
 
-  visit_initarray(node: XMLNode): HDLBlock {
+  visit_initarray(node: JSONNode): HDLBlock {
     return this.visit_begin(node);
   }
 
-  visit_inititem(node: XMLNode): HDLArrayItem {
+  visit_inititem(node: JSONNode): HDLArrayItem {
     this.expectChildren(node, 1, 1);
     return {
       index: parseInt(node.attrs['index']),
@@ -308,7 +310,7 @@ export class VerilogXMLParser implements HDLUnit {
     };
   }
 
-  visit_cfunc(node: XMLNode) {
+  visit_cfunc(node: JSONNode) {
     if (this.cur_module == null) {
       return;
     }
@@ -319,11 +321,11 @@ export class VerilogXMLParser implements HDLUnit {
     return block;
   }
 
-  visit_cuse(node: XMLNode) {
+  visit_cuse(node: JSONNode) {
     // TODO?
   }
 
-  visit_instance(node: XMLNode): HDLInstanceDef {
+  visit_instance(node: JSONNode): HDLInstanceDef {
     const instance: HDLInstanceDef = {
       $loc: this.parseSourceLocation(node),
       name: node.attrs['name'],
@@ -341,15 +343,15 @@ export class VerilogXMLParser implements HDLUnit {
     return instance;
   }
 
-  visit_iface(node: XMLNode) {
+  visit_iface(node: JSONNode) {
     throw new CompileError(this.cur_loc, `interfaces not supported`);
   }
 
-  visit_intfref(node: XMLNode) {
+  visit_intfref(node: JSONNode) {
     throw new CompileError(this.cur_loc, `interfaces not supported`);
   }
 
-  visit_port(node: XMLNode): HDLPort {
+  visit_port(node: JSONNode): HDLPort {
     this.expectChildren(node, 1, 1);
     const varref: HDLPort = {
       $loc: this.parseSourceLocation(node),
@@ -359,11 +361,11 @@ export class VerilogXMLParser implements HDLUnit {
     return varref;
   }
 
-  visit_netlist(node: XMLNode) {}
+  visit_netlist(node: JSONNode) {}
 
-  visit_files(node: XMLNode) {}
+  visit_files(node: JSONNode) {}
 
-  visit_module_files(node: XMLNode) {
+  visit_module_files(node: JSONNode) {
     node.children.forEach((n) => {
       if (n.obj) {
         const file = this.files[(n.obj as HDLFile).id];
@@ -372,16 +374,16 @@ export class VerilogXMLParser implements HDLUnit {
     });
   }
 
-  visit_file(node: XMLNode) {
+  visit_file(node: JSONNode) {
     return this.visit_file_or_module(node, false);
   }
 
   // TODO
-  visit_scope(node: XMLNode) {}
+  visit_scope(node: JSONNode) {}
 
-  visit_topscope(node: XMLNode) {}
+  visit_topscope(node: JSONNode) {}
 
-  visit_file_or_module(node: XMLNode, isModule: boolean): HDLFile {
+  visit_file_or_module(node: JSONNode, isModule: boolean): HDLFile {
     const file: HDLFile = {
       id: node.attrs['id'],
       filename: node.attrs['filename'],
@@ -391,7 +393,7 @@ export class VerilogXMLParser implements HDLUnit {
     return file;
   }
 
-  visit_cells(node: XMLNode) {
+  visit_cells(node: JSONNode) {
     this.expectChildren(node, 1, 9999);
     const hier = node.children[0].obj as HDLHierarchyDef;
     if (hier != null) {
@@ -400,7 +402,7 @@ export class VerilogXMLParser implements HDLUnit {
     }
   }
 
-  visit_cell(node: XMLNode): HDLHierarchyDef {
+  visit_cell(node: JSONNode): HDLHierarchyDef {
     const hier: HDLHierarchyDef = {
       $loc: this.parseSourceLocation(node),
       name: node.attrs['name'],
@@ -417,7 +419,7 @@ export class VerilogXMLParser implements HDLUnit {
     return hier;
   }
 
-  visit_basicdtype(node: XMLNode): HDLDataType {
+  visit_basicdtype(node: JSONNode): HDLDataType {
     let id = node.attrs['id'];
     let dtype: HDLDataType;
     const dtypename = node.attrs['name'];
@@ -459,30 +461,30 @@ export class VerilogXMLParser implements HDLUnit {
     return dtype;
   }
 
-  visit_refdtype(node: XMLNode) {}
+  visit_refdtype(node: JSONNode) {}
 
-  visit_enumdtype(node: XMLNode) {}
+  visit_enumdtype(node: JSONNode) {}
 
-  visit_enumitem(node: XMLNode) {}
+  visit_enumitem(node: JSONNode) {}
 
-  visit_packarraydtype(node: XMLNode): HDLDataType {
+  visit_packarraydtype(node: JSONNode): HDLDataType {
     // TODO: packed?
     return this.visit_unpackarraydtype(node);
   }
 
-  visit_memberdtype(node: XMLNode) {
+  visit_memberdtype(node: JSONNode) {
     throw new CompileError(null!, `structs not supported`);
   }
 
-  visit_constdtype(node: XMLNode) {
+  visit_constdtype(node: JSONNode) {
     // TODO? throw new CompileError(null, `constant data types not supported`);
   }
 
-  visit_paramtypedtype(node: XMLNode) {
+  visit_paramtypedtype(node: JSONNode) {
     // TODO? throw new CompileError(null, `constant data types not supported`);
   }
 
-  visit_unpackarraydtype(node: XMLNode): HDLDataType {
+  visit_unpackarraydtype(node: JSONNode): HDLDataType {
     let id = node.attrs['id'];
     let sub_dtype_id = node.attrs['sub_dtype_id'];
     let range = node.children[0].obj as HDLBinop;
@@ -505,7 +507,7 @@ export class VerilogXMLParser implements HDLUnit {
     }
   }
 
-  visit_senitem(node: XMLNode): HDLSensItem {
+  visit_senitem(node: JSONNode): HDLSensItem {
     const edgeType = node.attrs['edgeType'];
     if (edgeType != 'POS' && edgeType != 'NEG')
       throw new CompileError(this.cur_loc, 'POS/NEG required');
@@ -516,24 +518,24 @@ export class VerilogXMLParser implements HDLUnit {
     };
   }
 
-  visit_text(node: XMLNode) {}
+  visit_text(node: JSONNode) {}
 
-  visit_cstmt(node: XMLNode) {}
+  visit_cstmt(node: JSONNode) {}
 
-  visit_cfile(node: XMLNode) {}
+  visit_cfile(node: JSONNode) {}
 
-  visit_typetable(node: XMLNode) {}
+  visit_typetable(node: JSONNode) {}
 
-  visit_constpool(node: XMLNode) {}
+  visit_constpool(node: JSONNode) {}
 
-  visit_comment(node: XMLNode) {}
+  visit_comment(node: JSONNode) {}
 
-  expectChildren(node: XMLNode, low: number, high: number) {
+  expectChildren(node: JSONNode, low: number, high: number) {
     if (node.children.length < low || node.children.length > high)
       throw new CompileError(this.cur_loc, `expected between ${low} and ${high} children`);
   }
 
-  __visit_unop(node: XMLNode): HDLUnop {
+  __visit_unop(node: JSONNode): HDLUnop {
     this.expectChildren(node, 1, 1);
     const expr: HDLUnop = {
       $loc: this.parseSourceLocation(node),
@@ -545,18 +547,18 @@ export class VerilogXMLParser implements HDLUnit {
     return expr;
   }
 
-  visit_extend(node: XMLNode): HDLUnop {
+  visit_extend(node: JSONNode): HDLUnop {
     const unop = this.__visit_unop(node) as HDLExtendop;
     unop.width = parseInt(node.attrs['width']);
     unop.widthminv = parseInt(node.attrs['widthminv']);
     return unop;
   }
 
-  visit_extends(node: XMLNode): HDLUnop {
+  visit_extends(node: JSONNode): HDLUnop {
     return this.visit_extend(node);
   }
 
-  __visit_binop(node: XMLNode): HDLBinop {
+  __visit_binop(node: JSONNode): HDLBinop {
     this.expectChildren(node, 2, 2);
     const expr: HDLBinop = {
       $loc: this.parseSourceLocation(node),
@@ -569,7 +571,7 @@ export class VerilogXMLParser implements HDLUnit {
     return expr;
   }
 
-  visit_if(node: XMLNode): HDLTriop {
+  visit_if(node: JSONNode): HDLTriop {
     this.expectChildren(node, 2, 3);
     const expr: HDLTriop = {
       $loc: this.parseSourceLocation(node),
@@ -583,7 +585,7 @@ export class VerilogXMLParser implements HDLUnit {
   }
 
   // while and for loops
-  visit_while(node: XMLNode): HDLWhileOp {
+  visit_while(node: JSONNode): HDLWhileOp {
     this.expectChildren(node, 2, 4);
     const expr: HDLWhileOp = {
       $loc: this.parseSourceLocation(node),
@@ -597,7 +599,7 @@ export class VerilogXMLParser implements HDLUnit {
     return expr;
   }
 
-  __visit_triop(node: XMLNode): HDLBinop {
+  __visit_triop(node: JSONNode): HDLBinop {
     this.expectChildren(node, 3, 3);
     const expr: HDLTriop = {
       $loc: this.parseSourceLocation(node),
@@ -611,7 +613,7 @@ export class VerilogXMLParser implements HDLUnit {
     return expr;
   }
 
-  __visit_func(node: XMLNode): HDLFuncCall {
+  __visit_func(node: JSONNode): HDLFuncCall {
     const expr: HDLFuncCall = {
       $loc: this.parseSourceLocation(node),
       dtype: null!,
@@ -622,195 +624,195 @@ export class VerilogXMLParser implements HDLUnit {
     return expr;
   }
 
-  visit_not(node: XMLNode) {
+  visit_not(node: JSONNode) {
     return this.__visit_unop(node);
   }
-  visit_negate(node: XMLNode) {
+  visit_negate(node: JSONNode) {
     return this.__visit_unop(node);
   }
-  visit_redand(node: XMLNode) {
+  visit_redand(node: JSONNode) {
     return this.__visit_unop(node);
   }
-  visit_redor(node: XMLNode) {
+  visit_redor(node: JSONNode) {
     return this.__visit_unop(node);
   }
-  visit_redxor(node: XMLNode) {
+  visit_redxor(node: JSONNode) {
     return this.__visit_unop(node);
   }
-  visit_initial(node: XMLNode) {
+  visit_initial(node: JSONNode) {
     return this.__visit_unop(node);
   }
-  visit_ccast(node: XMLNode) {
+  visit_ccast(node: JSONNode) {
     return this.__visit_unop(node);
   }
-  visit_creset(node: XMLNode) {
+  visit_creset(node: JSONNode) {
     return this.__visit_unop(node);
   }
-  visit_creturn(node: XMLNode) {
+  visit_creturn(node: JSONNode) {
     return this.__visit_unop(node);
   }
 
-  visit_contassign(node: XMLNode) {
+  visit_assignw(node: JSONNode) {
     return this.__visit_binop(node);
   }
-  visit_assigndly(node: XMLNode) {
+  visit_assigndly(node: JSONNode) {
     return this.__visit_binop(node);
   }
-  visit_assignpre(node: XMLNode) {
+  visit_assignpre(node: JSONNode) {
     return this.__visit_binop(node);
   }
-  visit_assignpost(node: XMLNode) {
+  visit_assignpost(node: JSONNode) {
     return this.__visit_binop(node);
   }
-  visit_assign(node: XMLNode) {
+  visit_assign(node: JSONNode) {
     return this.__visit_binop(node);
   }
-  visit_arraysel(node: XMLNode) {
+  visit_arraysel(node: JSONNode) {
     return this.__visit_binop(node);
   }
-  visit_wordsel(node: XMLNode) {
+  visit_wordsel(node: JSONNode) {
     return this.__visit_binop(node);
   }
 
-  visit_eq(node: XMLNode) {
+  visit_eq(node: JSONNode) {
     return this.__visit_binop(node);
   }
-  visit_neq(node: XMLNode) {
+  visit_neq(node: JSONNode) {
     return this.__visit_binop(node);
   }
-  visit_lte(node: XMLNode) {
+  visit_lte(node: JSONNode) {
     return this.__visit_binop(node);
   }
-  visit_gte(node: XMLNode) {
+  visit_gte(node: JSONNode) {
     return this.__visit_binop(node);
   }
-  visit_lt(node: XMLNode) {
+  visit_lt(node: JSONNode) {
     return this.__visit_binop(node);
   }
-  visit_gt(node: XMLNode) {
+  visit_gt(node: JSONNode) {
     return this.__visit_binop(node);
   }
-  visit_and(node: XMLNode) {
+  visit_and(node: JSONNode) {
     return this.__visit_binop(node);
   }
-  visit_or(node: XMLNode) {
+  visit_or(node: JSONNode) {
     return this.__visit_binop(node);
   }
-  visit_xor(node: XMLNode) {
+  visit_xor(node: JSONNode) {
     return this.__visit_binop(node);
   }
-  visit_add(node: XMLNode) {
+  visit_add(node: JSONNode) {
     return this.__visit_binop(node);
   }
-  visit_sub(node: XMLNode) {
+  visit_sub(node: JSONNode) {
     return this.__visit_binop(node);
   }
-  visit_concat(node: XMLNode) {
+  visit_concat(node: JSONNode) {
     return this.__visit_binop(node);
   } // TODO?
-  visit_shiftl(node: XMLNode) {
+  visit_shiftl(node: JSONNode) {
     return this.__visit_binop(node);
   }
-  visit_shiftr(node: XMLNode) {
+  visit_shiftr(node: JSONNode) {
     return this.__visit_binop(node);
   }
-  visit_shiftrs(node: XMLNode) {
+  visit_shiftrs(node: JSONNode) {
     return this.__visit_binop(node);
   }
 
-  visit_mul(node: XMLNode) {
+  visit_mul(node: JSONNode) {
     return this.__visit_binop(node);
   }
-  visit_div(node: XMLNode) {
+  visit_div(node: JSONNode) {
     return this.__visit_binop(node);
   }
-  visit_moddiv(node: XMLNode) {
+  visit_moddiv(node: JSONNode) {
     return this.__visit_binop(node);
   }
-  visit_muls(node: XMLNode) {
+  visit_muls(node: JSONNode) {
     return this.__visit_binop(node);
   }
-  visit_divs(node: XMLNode) {
+  visit_divs(node: JSONNode) {
     return this.__visit_binop(node);
   }
-  visit_moddivs(node: XMLNode) {
+  visit_moddivs(node: JSONNode) {
     return this.__visit_binop(node);
   }
-  visit_gts(node: XMLNode) {
+  visit_gts(node: JSONNode) {
     return this.__visit_binop(node);
   }
-  visit_lts(node: XMLNode) {
+  visit_lts(node: JSONNode) {
     return this.__visit_binop(node);
   }
-  visit_gtes(node: XMLNode) {
+  visit_gtes(node: JSONNode) {
     return this.__visit_binop(node);
   }
-  visit_ltes(node: XMLNode) {
+  visit_ltes(node: JSONNode) {
     return this.__visit_binop(node);
   }
   // TODO: more?
 
-  visit_range(node: XMLNode) {
+  visit_range(node: JSONNode) {
     return this.__visit_binop(node);
   }
 
-  visit_cond(node: XMLNode) {
+  visit_cond(node: JSONNode) {
     return this.__visit_triop(node);
   }
-  visit_condbound(node: XMLNode) {
+  visit_condbound(node: JSONNode) {
     return this.__visit_triop(node);
   }
-  visit_sel(node: XMLNode) {
+  visit_sel(node: JSONNode) {
     return this.__visit_triop(node);
   }
 
-  visit_changedet(node: XMLNode) {
+  visit_changedet(node: JSONNode) {
     if (node.children.length == 0) return null;
     else return this.__visit_binop(node);
   }
 
-  visit_ccall(node: XMLNode) {
+  visit_ccall(node: JSONNode) {
     return this.__visit_func(node);
   }
-  visit_finish(node: XMLNode) {
+  visit_finish(node: JSONNode) {
     return this.__visit_func(node);
   }
-  visit_stop(node: XMLNode) {
+  visit_stop(node: JSONNode) {
     return this.__visit_func(node);
   }
-  visit_rand(node: XMLNode) {
+  visit_rand(node: JSONNode) {
     return this.__visit_func(node);
   }
-  visit_time(node: XMLNode) {
+  visit_time(node: JSONNode) {
     return this.__visit_func(node);
   }
 
-  visit_display(node: XMLNode) {
+  visit_display(node: JSONNode) {
     return null;
   }
-  visit_sformatf(node: XMLNode) {
+  visit_sformatf(node: JSONNode) {
     return null;
   }
-  visit_scopename(node: XMLNode) {
+  visit_scopename(node: JSONNode) {
     return null;
   }
 
-  visit_readmem(node: XMLNode) {
+  visit_readmem(node: JSONNode) {
     return this.__visit_func(node);
   }
 
   // Expressions for verilator 5 (TODO)
 
-  visit_stmtexpr(node: XMLNode) {
+  visit_stmtexpr(node: JSONNode) {
     return this.__visit_unop(node); // A single operation
   }
 
-  visit_textblock(node: XMLNode) {
+  visit_textblock(node: JSONNode) {
     // TODO
     return null;
   }
 
-  visit_cmethodhard(node: XMLNode) {
+  visit_cmethodhard(node: JSONNode) {
     const name = node.attrs['name'];
     node.type = name; // To propagate to Xop
     // Depends on the name, is the operation
@@ -828,12 +830,12 @@ export class VerilogXMLParser implements HDLUnit {
     }
   }
 
-  visit_logand(node: XMLNode) {
+  visit_logand(node: JSONNode) {
     // TODO
     return null;
   }
 
-  visit_voiddtype(node: XMLNode) {
+  visit_voiddtype(node: JSONNode) {
     let id = node.attrs['id'];
     let dtype: HDLDataType;
 
@@ -850,7 +852,7 @@ export class VerilogXMLParser implements HDLUnit {
 
   //
 
-  xml_open(node: XMLNode) {
+  xml_open(node: JSONNode) {
     this.cur_node = node;
     const method = (this as any)[`open_${node.type}`];
     if (method) {
@@ -858,7 +860,7 @@ export class VerilogXMLParser implements HDLUnit {
     }
   }
 
-  xml_close(node: XMLNode) {
+  xml_close(node: JSONNode) {
     this.cur_node = node;
     const method = (this as any)[`visit_${node.type}`];
     if (method) {
@@ -868,8 +870,9 @@ export class VerilogXMLParser implements HDLUnit {
     }
   }
 
-  parse(xmls: string) {
-    parseXMLPoorly(xmls, this.xml_open.bind(this), this.xml_close.bind(this));
+  parse(jsons: string) {
+    parseJSONPoorly(jsons, this.xml_open.bind(this), this.xml_close.bind(this));
+
     this.cur_node = null!;
     this.run_deferred();
   }

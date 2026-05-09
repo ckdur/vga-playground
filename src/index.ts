@@ -99,7 +99,11 @@ function reset() {
 
 async function initModule(modules: Record<string, HDLModuleDef>) {
   if (jmod) jmod.dispose();
-  jmod = new HDLModuleWASM(modules['TOP'], modules['@CONST-POOL@']);
+  let mod = modules['TOP'];
+  if (!mod) {
+    mod = modules['$root']
+  }
+  jmod = new HDLModuleWASM(mod, modules['@CONST-POOL@']);
   await jmod.init();
   jmod.getFileData = (path) => currentProject.dataFiles?.[path];
   uo_out_offset = jmod.globals.lookup('uo_out').offset;
