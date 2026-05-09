@@ -13,6 +13,7 @@ import {
   HDLHierarchyDef,
   HDLInstanceDef,
   HDLLogicType,
+  HDLVlTriggerVecType,
   HDLModuleDef,
   HDLNativeType,
   HDLPort,
@@ -432,6 +433,15 @@ export class VerilogXMLParser implements HDLUnit {
         };
         dtype = dlogic;
         break;
+      case 'VlTriggerVec': // TODO
+        let dtrigger: HDLVlTriggerVecType = {
+          $loc: this.parseSourceLocation(node),
+          left: parseInt(node.attrs['left'] || '0'),
+          right: parseInt(node.attrs['right'] || '0'),
+          signed: node.attrs['signed'] == 'true',
+        };
+        dtype = dtrigger;
+        break
       case 'string':
         let dstring: HDLNativeType = {
           $loc: this.parseSourceLocation(node),
@@ -787,6 +797,55 @@ export class VerilogXMLParser implements HDLUnit {
 
   visit_readmem(node: XMLNode) {
     return this.__visit_func(node);
+  }
+
+  // Expressions for verilator 5 (TODO)
+
+  visit_stmtexpr(node: XMLNode) {
+    return this.__visit_unop(node); // A single operation
+  }
+
+  visit_textblock(node: XMLNode) {
+    // TODO
+    return null;
+  }
+
+  visit_cmethodhard(node: XMLNode) {
+    const name = node.attrs['name'];
+    node.type = name; // To propagate to Xop
+    // Depends on the name, is the operation
+    if(node.children.length == 1) {
+      return this.__visit_unop(node); // One op
+    }
+    else if(node.children.length == 2) {
+      return this.__visit_binop(node); // Two ops
+    }
+    else if(node.children.length == 3) {
+      return this.__visit_triop(node); // Three ops
+    }
+    else {
+      return; // TODO: No fail?
+    }
+  }
+
+  visit_logand(node: XMLNode) {
+    // TODO
+    return null;
+  }
+
+  visit_voiddtype(node: XMLNode) {
+    let id = node.attrs['id'];
+    let dtype: HDLDataType;
+
+    // Is actually useless
+    let dstring: HDLNativeType = {
+      $loc: this.parseSourceLocation(node),
+      jstype: 'string',
+    };
+    dtype = dstring;
+
+    this.dtypes[id] = dtype;
+    return dtype;
   }
 
   //

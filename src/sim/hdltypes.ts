@@ -29,6 +29,12 @@ export interface HDLLogicType extends HDLSourceObject {
   signed: boolean;
 }
 
+export interface HDLVlTriggerVecType extends HDLSourceObject {
+  left: number;
+  right: number;
+  signed: boolean;
+}
+
 export interface HDLUnpackArray extends HDLSourceObject {
   subtype: HDLDataType;
   low: HDLConstant;

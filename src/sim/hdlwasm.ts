@@ -69,6 +69,8 @@ function getDataTypeSize(dt: HDLDataType): number {
   } else if (isArrayType(dt)) {
     // TODO: additional padding for array?
     return (Math.abs(dt.high.cvalue - dt.low.cvalue) + 1) * getDataTypeSize(dt.subtype);
+  } else if (dt.jstype == "string") {
+    return 0; // TODO?
   } else {
     throw new HDLError(dt, `don't know data type`);
   }
@@ -2290,6 +2292,11 @@ export class HDLModuleWASM implements HDLModuleRunner {
   }
 
   _creturn2wasm(e: HDLUnop, opts: Options) {
+    return this.bmod.return(this.e2w(e.left, opts));
+  }
+
+  _stmtexpr2wasm(e: HDLUnop, opts: Options) {
+    // Handles calls, and also
     return this.bmod.return(this.e2w(e.left, opts));
   }
 

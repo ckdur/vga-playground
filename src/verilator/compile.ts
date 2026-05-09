@@ -1,6 +1,8 @@
 import { VerilogXMLParser } from '../sim/vxmlparser';
 import { ErrorParser } from './ErrorParser';
 import verilator_bin from './verilator_bin';
+import verilated_std_waiver_vlt from './verilated_std_waiver.vlt?raw';
+import verilated_std_sv from './verilated_std.sv?raw';
 
 let browserWasmBin: ArrayBuffer | null = null;
 
@@ -37,6 +39,11 @@ export async function compileVerilator(opts: ICompileOptions) {
 
   let sourceList: string[] = [];
   FS.mkdir('src');
+  FS.mkdir('/share');
+  FS.mkdir('/share/verilator');
+  FS.mkdir('/share/verilator/include');
+  FS.writeFile('/share/verilator/include/verilated_std_waiver.vlt', verilated_std_waiver_vlt);
+  FS.writeFile('/share/verilator/include/verilated_std.sv', verilated_std_sv);
   for (const [name, source] of Object.entries(opts.sources)) {
     const path = `src/${name}`;
     FS.writeFile(path, source);
@@ -52,7 +59,9 @@ export async function compileVerilator(opts: ICompileOptions) {
       '-O3',
       '-Wall',
       '-Wno-EOFNEWLINE',
-      '-Wno-DECLFILENAME',
+      '-Wno-DECLFILENAME', 
+      // Why do you even care?
+      '-Wno-UNOPTFLAT', '-Wno-BLKSEQ', '-Wno-UNDRIVEN', '-Wno-PINMISSING', '-Wno-UNUSED',
       '--x-assign',
       'fast',
       '--debug-check', // for XML output
@@ -77,9 +86,35 @@ export async function compileVerilator(opts: ICompileOptions) {
     return { errors: errorParser.errors };
   }
 
+  function downloadRawFile(
+    content: string, 
+    fileName: string, 
+    contentType: string = 'text/plain'
+  ) {
+    // 1. Create a Blob from the raw string
+    const blob = new Blob([content], { type: contentType });
+
+    // 2. Create a temporary URL pointing to that Blob
+    const url = window.URL.createObjectURL(blob);
+
+    // 3. Create a hidden 'a' element
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = fileName;
+
+    // 4. Append to body, click it, and remove it
+    document.body.appendChild(link);
+    link.click();
+    
+    // Clean up
+    document.body.removeChild(link);
+    window.URL.revokeObjectURL(url);
+  }
+
   const xmlParser = new VerilogXMLParser();
   try {
     const xmlContent = FS.readFile(xmlPath, { encoding: 'utf8' });
+    //downloadRawFile(xmlContent, `V${opts.topModule}.xml`);
     xmlParser.parse(xmlContent);
   } catch (e) {
     console.log(e, (e as Error).stack);
