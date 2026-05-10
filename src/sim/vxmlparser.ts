@@ -113,7 +113,7 @@ export class VerilogJSONParser implements HDLUnit {
       if (loc == this.cur_loc_str) {
         return this.cur_loc; // cache last parsed $loc object
       } else {
-        const [fileid, line, col, end_line, end_col] = loc.split(',');
+        const [fileid, line, col, end_line, end_col] = loc.split(/[,:]/);
         const file = this.files[fileid] ?? fileid
         const filename = file.filename ?? fileid
         const $loc = {
@@ -148,7 +148,7 @@ export class VerilogJSONParser implements HDLUnit {
   }
 
   deferDataType(node: JSONNode, def: HDLDataTypeObject) {
-    const dtype_id = node.attrs['dtype_id'];
+    const dtype_id = node.attrs['dtypep'];
     if (dtype_id != null) {
       this.defer(() => {
         def.dtype = this.dtypes[dtype_id];
@@ -170,7 +170,15 @@ export class VerilogJSONParser implements HDLUnit {
       if (numstr.length <= 8) return { value: parseInt(numstr, 16), origWidth };
       else return { value: BigInt('0x' + numstr), origWidth };
     } else {
-      throw new CompileError(this.cur_loc, `could not parse constant "${s}"`);
+      try {
+        // Just try to treat it as a number of 32 bits
+        const num = parseInt(s);
+        const origWidth = 32;
+        return { value: num, origWidth }
+      }
+      catch {
+        throw new CompileError(this.cur_loc, `could not parse constant "${s}"`);
+      }
     }
   }
 
@@ -316,7 +324,14 @@ export class VerilogJSONParser implements HDLUnit {
     }
     const block = this.visit_begin(node);
     block.exprs = [];
-    node.children.forEach((n) => block.exprs.push(n.obj));
+    node.children.forEach((n) => {
+      if(n.attrs["JSONfrom"] == "argsp") {
+        if(n.type != "var") return; // Skips assigns with cresets
+        n.attrs["param"] = "true";
+        n.obj.isParam = true;
+      }
+      block.exprs.push(n.obj)
+    });
     this.cur_module.blocks.push(block);
     return block;
   }
@@ -419,18 +434,28 @@ export class VerilogJSONParser implements HDLUnit {
     return hier;
   }
 
+  parseRange(text: string | undefined): [number, number] {
+    if(!text) {
+      return [0, 0]
+    }
+    const [high, low] = text.split(':').map(Number);
+    
+    return [high, low];
+  }
+
   visit_basicdtype(node: JSONNode): HDLDataType {
-    let id = node.attrs['id'];
+    let id = node.attrs['dtypep'];
     let dtype: HDLDataType;
     const dtypename = node.attrs['name'];
     switch (dtypename) {
       case 'logic':
       case 'integer': // TODO?
       case 'bit':
+        const [msb, lsb] = this.parseRange(node.attrs['range']);
         let dlogic: HDLLogicType = {
           $loc: this.parseSourceLocation(node),
-          left: parseInt(node.attrs['left'] || '0'),
-          right: parseInt(node.attrs['right'] || '0'),
+          left: msb,
+          right: lsb,
           signed: node.attrs['signed'] == 'true',
         };
         dtype = dlogic;
@@ -485,8 +510,8 @@ export class VerilogJSONParser implements HDLUnit {
   }
 
   visit_unpackarraydtype(node: JSONNode): HDLDataType {
-    let id = node.attrs['id'];
-    let sub_dtype_id = node.attrs['sub_dtype_id'];
+    let id = node.attrs['dtypep'];
+    let sub_dtype_id = node.attrs['refDTypep'];
     let range = node.children[0].obj as HDLBinop;
     if (isConstExpr(range.left) && isConstExpr(range.right)) {
       const dtype: HDLUnpackArray = {
@@ -520,7 +545,7 @@ export class VerilogJSONParser implements HDLUnit {
 
   visit_text(node: JSONNode) {}
 
-  visit_cstmt(node: JSONNode) {}
+  visit_cstmt(node: JSONNode) {} // For debugs, so disabled
 
   visit_cfile(node: JSONNode) {}
 
@@ -586,17 +611,38 @@ export class VerilogJSONParser implements HDLUnit {
 
   // while and for loops
   visit_while(node: JSONNode): HDLWhileOp {
-    this.expectChildren(node, 2, 4);
+    //this.expectChildren(node, 2, 4);
+    // The structure of whiles now is different
+    // everything that is not a "LOOPTEST belongs to the body"
+    // We need to create a mock node for the body only
+    var node_body: JSONNode = { 
+      type: "begin",
+      text: null, 
+      children: node.children.filter(x => x.type != "looptest"), 
+      attrs: {},
+      obj: null };
     const expr: HDLWhileOp = {
       $loc: this.parseSourceLocation(node),
       op: 'while',
       dtype: null!,
-      precond: node.children[0].obj as HDLExpr,
-      loopcond: node.children[1].obj as HDLExpr,
-      body: node.children[2] && (node.children[2].obj as HDLExpr),
-      inc: node.children[3] && (node.children[3].obj as HDLExpr),
+      precond: node.children[0].type === "looptest" 
+          ? (node.children[0].obj as HDLExpr) 
+          : null!,
+      loopcond: node.children[node.children.length-1].type === "looptest" 
+          ? (node.children[node.children.length-1].obj as HDLExpr) 
+          : null!,
+      body: this.visit_begin(node_body),
+      inc: null!, // No more increments
     };
     return expr;
+  }
+
+  visit_loop(node: JSONNode): HDLWhileOp {
+    return this.visit_while(node)
+  }
+
+  visit_looptest(node: JSONNode) {
+    return this.visit_begin(node)  // Is just another begin
   }
 
   __visit_triop(node: JSONNode): HDLBinop {
@@ -646,6 +692,17 @@ export class VerilogJSONParser implements HDLUnit {
     return this.__visit_unop(node);
   }
   visit_creset(node: JSONNode) {
+    if(node.children.length == 0) {
+      // Treat it as a zero constant
+      var elemp_node: JSONNode = { 
+        type: "const", 
+        text: null, 
+        children: [], 
+        attrs: { ...node.attrs }, 
+        obj: null };
+      elemp_node.attrs["name"] = "0";
+      return this.visit_const(elemp_node);
+    }
     return this.__visit_unop(node);
   }
   visit_creturn(node: JSONNode) {
@@ -831,18 +888,17 @@ export class VerilogJSONParser implements HDLUnit {
   }
 
   visit_logand(node: JSONNode) {
-    // TODO
-    return null;
+      return this.__visit_binop(node);
   }
 
   visit_voiddtype(node: JSONNode) {
-    let id = node.attrs['id'];
+    let id = node.attrs['dtypep'];
     let dtype: HDLDataType;
 
     // Is actually useless
     let dstring: HDLNativeType = {
       $loc: this.parseSourceLocation(node),
-      jstype: 'string',
+      jstype: 'undefined',
     };
     dtype = dstring;
 

@@ -47,7 +47,9 @@ export function parseJSONPoorly(
   }
   
   // A record to keep what are the interations (IN ORDER)
-  const priority: string[] = ["modulesp", "stmtsp", "scopep", "stmtsp", "exprp", "rhsp", "lhsp", "fromp", "bitp", "condp", "thensp", "elsesp"];
+  const priority: string[] = ["miscsp", "filesp", "modulesp", "argsp", "varsp",
+    "scopep", "stmtsp", "typesp", "exprp", "rhsp", "lhsp", 
+    "fromp", "bitp", "condp", "thensp", "elsesp", "attrsp"];
 
   function iterate_object(o: Record<string, any>) {
     // Extract attrs
@@ -59,7 +61,7 @@ export function parseJSONPoorly(
       }
     }
 
-    console.log(o["type"])
+    //console.log(o["type"])
     // Create the node as-is
     var node = { type: o["type"].toLowerCase(), text: null, children: [], attrs: attrs, obj: null };
     stack.push(node);
@@ -67,18 +69,69 @@ export function parseJSONPoorly(
       node.obj = openfn(node)
     }
 
-    for (const p of priority) { 
-      const iobj = o[p]
-      if(Array.isArray(iobj)) { // An identifiable type to just iterate downwards
-        iobj.forEach((o2: Record<string, any>) => {iterate_object(o2)})
+    function just_push_elem(rec: string) {
+      const elemp = o[rec];
+      if(!elemp || elemp.length == 0) {
+        throw new JSONParseError(`${rec} is empty`);
+      }
+      iterate_object(elemp[0]);
+    }
+
+    function push_as_begin(rec: string) {
+      const elemp = o[rec];
+      if(elemp && elemp.length > 0) {
+        var elemp_node = { type: "begin", text: null, children: [], attrs: {}, obj: null };
+        stack.push(elemp_node);
+        if(openfn) {
+          elemp_node.obj = openfn(elemp_node)
+        }
+        elemp.forEach((o2: Record<string, any>) => {iterate_object(o2)});
+        closetop()
       }
     }
+
+    // Special cases for IF
+    if(o["type"] == "IF") {
+      just_push_elem("condp")
+      // treat the other ones as begin
+      push_as_begin("thensp")
+      push_as_begin("elsesp")
+    }
+    else if(o["type"] == "COND") {
+      just_push_elem("condp")
+      just_push_elem("thenp")
+      just_push_elem("elsep")
+    }
+    else {
+      for (const p of priority) { 
+        const iobj = o[p]
+        if(Array.isArray(iobj)) { // An identifiable type to just iterate downwards
+          iobj.forEach((o2: Record<string, any>) => {
+            o2["JSONfrom"] = p
+            iterate_object(o2)
+          });
+        }
+      }
+      // Process everything that is not inside of the priority list
+      for (const p of Object.keys(o)) {
+        const iobj = o[p]
+        if(!priority.includes(p) && Array.isArray(iobj)) { // Other iterables
+          iobj.forEach((o2: Record<string, any>) => {
+            o2["JSONfrom"] = p
+            iterate_object(o2)
+          });
+        }
+      }
+    }
+
     closetop()
   }
+  var node = { type: "GLOBAL", text: null, children: [], attrs: {}, obj: null };
+  stack.push(node);
   iterate_object(obj)
 
   if (stack.length != 1) throw new JSONParseError('tag not closed');
-  if (stack[0].type != '?xml') throw new JSONParseError('?xml needs to be first element');
+  if (stack[0].type != 'GLOBAL') throw new JSONParseError('GLOBAL needs to be first element');
   if (!top) throw new JSONParseError('no top');
   return top;
 }

@@ -131,7 +131,7 @@ export async function compileVerilator(opts: ICompileOptions) {
           file: '',
           line: 1,
           column: 1,
-          message: 'XML parsing failed: ' + e,
+          message: 'JSON parsing failed: ' + e,
         },
       ],
     };

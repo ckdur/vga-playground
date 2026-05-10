@@ -39,6 +39,7 @@ const VERILATOR_UNIT_FUNCTIONS = [
   '_eval_settle',
   '_eval',
   '_change_request',
+  "_eval_static"
 ];
 
 interface Options {
@@ -501,6 +502,7 @@ export class HDLModuleWASM implements HDLModuleRunner {
   private genFunction(block: HDLBlock) {
     // TODO: cfuncs only
     var fnname = block.name;
+    if(VERILATOR_UNIT_FUNCTIONS.includes(fnname)) return; // TODO: Not adding this?
     // find locals of function
     var fscope = new Struct();
     fscope.addEntry(GLOBAL, 4, binaryen.i32, undefined, true); // 1st param to function
@@ -511,8 +513,9 @@ export class HDLModuleWASM implements HDLModuleRunner {
     this.pushScope(fscope);
     block.exprs.forEach((e) => {
       if (e && isVarDecl(e)) {
+        // TODO: IMPORTANT: Vars with args are not recognized. Put it them as global
         // TODO: make local reference types, instead of promoting local arrays to global
-        if (isReferenceType(e.dtype)) {
+        if (isReferenceType(e.dtype) || e.isParam) {
           this.globals.addVar(e);
         } else {
           fscope.addVar(e);
@@ -1002,15 +1005,21 @@ export class HDLModuleWASM implements HDLModuleRunner {
 
   const2wasm(e: HDLConstant, opts?: Options): number {
     var size = getDataTypeSize(e.dtype);
-    if (isLogicType(e.dtype)) {
+    //                          creset are set as const with possible array type
+    if (isLogicType(e.dtype) || isArrayType(e.dtype)) {
       if (e.bigvalue != null) {
         let low = e.bigvalue & BigInt(0xffffffff);
         let high = (e.bigvalue >> BigInt(32)) & BigInt(0xffffffff);
         return this.i3264(e.dtype).const(Number(low), Number(high));
-      } else if (size <= 4) return this.bmod.i32.const(e.cvalue | 0);
+      } else if (size <= 4 || (isArrayType(e.dtype) && e.origWidth == 32)) return this.bmod.i32.const(e.cvalue | 0);
       else if (size <= 8) return this.bmod.i64.const(e.cvalue | 0, 0);
-      else throw new HDLError(e, `constants > 64 bits not supported`);
-    } else {
+      else
+        throw new HDLError(e, `constants > 64 bits not supported`);
+    } 
+    else if(e.dtype.jstype == "string") {
+      return this.bmod.nop() // TODO: Nothing, as strings are not supported
+    }
+    else {
       throw new HDLError(e, `non-logic constants not supported`);
     }
   }
@@ -2121,7 +2130,9 @@ export class HDLModuleWASM implements HDLModuleRunner {
   }
 
   storemem(e: HDLSourceObject, ptr: number, offset: number, size: number, value: number): number {
-    if (size == 1) {
+    if (e.dtype && isArrayType(e.dtype)) {
+      return this.bmod.nop(); // TODO: FOR NOW IGNORING THIS
+    } else if (size == 1) {
       return this.bmod.i32.store8(offset, 1, ptr, value);
     } else if (size == 2) {
       return this.bmod.i32.store16(offset, 2, ptr, value);
@@ -2175,6 +2186,9 @@ export class HDLModuleWASM implements HDLModuleRunner {
 
   _assign2wasm(e: HDLBinop, opts: Options) {
     return this.assign2wasm(e.right, e.left);
+  }
+  _assignw2wasm(e: HDLBinop, opts: Options) {
+    return this._assign2wasm(e, opts);
   }
   _assignpre2wasm(e: HDLBinop, opts: Options) {
     return this._assign2wasm(e, opts);
@@ -2395,6 +2409,9 @@ export class HDLModuleWASM implements HDLModuleRunner {
   }
   _and2wasm(e: HDLBinop) {
     return this.binop(e, this.i3264rel(e).and);
+  }
+  _logand2wasm(e: HDLBinop) {
+    return this.binop(e, this.i3264rel(e).and); // TODO: This is NOT how it is done
   }
   _xor2wasm(e: HDLBinop) {
     return this.binop(e, this.i3264rel(e).xor);
