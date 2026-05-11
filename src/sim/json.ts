@@ -48,7 +48,7 @@ export function parseJSONPoorly(
   
   // A record to keep what are the interations (IN ORDER)
   const priority: string[] = ["miscsp", "filesp", "modulesp", "argsp", "varsp",
-    "scopep", "stmtsp", "typesp", "exprp", "rhsp", "lhsp", 
+    "scopep", "stmtsp", "typesp", "exprp", "lhsp", "rhsp", 
     "fromp", "bitp", "condp", "thensp", "elsesp", "attrsp"];
 
   function iterate_object(o: Record<string, any>) {

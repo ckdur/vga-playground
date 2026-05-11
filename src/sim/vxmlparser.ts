@@ -449,8 +449,10 @@ export class VerilogJSONParser implements HDLUnit {
     let id = node.attrs['dtypep'];
     let dtype: HDLDataType;
     const dtypename = node.attrs['name'];
+    let b = true
     switch (dtypename) {
       case 'logic':
+        b = false
       case 'integer': // TODO?
       case 'bit':
         const [msb, lsb] = this.parseRange(node.attrs['range']);
@@ -459,18 +461,10 @@ export class VerilogJSONParser implements HDLUnit {
           left: msb,
           right: lsb,
           signed: node.attrs['signed'] == 'true',
+          bit: b
         };
         dtype = dlogic;
         break;
-      case 'VlTriggerVec': // TODO
-        let dtrigger: HDLVlTriggerVecType = {
-          $loc: this.parseSourceLocation(node),
-          left: parseInt(node.attrs['left'] || '0'),
-          right: parseInt(node.attrs['right'] || '0'),
-          signed: node.attrs['signed'] == 'true',
-        };
-        dtype = dtrigger;
-        break
       case 'string':
         let dstring: HDLNativeType = {
           $loc: this.parseSourceLocation(node),
