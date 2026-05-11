@@ -307,6 +307,8 @@ export class VerilogJSONParser implements HDLUnit {
   }
 
   visit_initarray(node: JSONNode): HDLBlock {
+    // Pre-filter out the defaultp
+    node.children = node.children.filter((x) => x.attrs["JSONfrom"] != "defaultp")
     return this.visit_begin(node);
   }
 
@@ -663,7 +665,7 @@ export class VerilogJSONParser implements HDLUnit {
     const expr: HDLFuncCall = {
       $loc: this.parseSourceLocation(node),
       dtype: null!,
-      funcname: node.attrs['func'] || '$' + node.type,
+      funcname: node.attrs['funcName'] || '$' + node.type,
       args: node.children.map((n) => n.obj as HDLExpr),
     };
     this.deferDataType(node, expr);

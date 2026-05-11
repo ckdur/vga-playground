@@ -124,6 +124,7 @@ if (res.output) {
     await initModule(res.output.modules);
     stopped = false;
   } catch (e) {
+    console.log(e, (e as Error).stack);
     errorOverlay.show('Simulation Error', e instanceof Error ? e.message : String(e));
   }
 } else {

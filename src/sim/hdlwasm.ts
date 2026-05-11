@@ -38,8 +38,8 @@ const VERILATOR_UNIT_FUNCTIONS = [
   '_eval_initial',
   '_eval_settle',
   '_eval',
-  '_change_request',
-  "_eval_static"
+  //'_change_request',
+  '_eval_static'
 ];
 
 interface Options {
@@ -200,7 +200,7 @@ class Struct {
       size: size,
       itype: itype,
       index: this.params.length + this.locals.length,
-      offset: this.len,
+      offset: isParam ? (this.params.length) : this.len,
       init: null,
       constval: null,
       reset: false,
@@ -222,6 +222,10 @@ class Struct {
 
   lookup(name: string): StructRec {
     return this.vars[name];
+  }
+
+  lookparam(name: string): StructRec {
+    return this.params.filter((x) => x.name == name)[0];
   }
 }
 
@@ -259,6 +263,8 @@ export class HDLModuleWASM implements HDLModuleRunner {
   finished!: boolean;
   stopped!: boolean;
   resetStartTimeMsec!: number;
+
+  downloaded: boolean = false;
 
   _tick2!: (ofs: number, iters: number) => void;
 
@@ -302,10 +308,11 @@ export class HDLModuleWASM implements HDLModuleRunner {
     for (var i = 0; i < 100; i++) {
       (this.instance.exports as any)._eval_settle(GLOBALOFS);
       (this.instance.exports as any)._eval(GLOBALOFS);
-      var Vchange = (this.instance.exports as any)._change_request(GLOBALOFS);
+      return;
+      /*var Vchange = (this.instance.exports as any)._change_request(GLOBALOFS);
       if (!Vchange) {
         return;
-      }
+      }*/
     }
     throw new HDLError(null, `model did not converge on reset()`);
   }
@@ -474,8 +481,37 @@ export class HDLModuleWASM implements HDLModuleRunner {
     this.addImportedFunctions();
   }
 
+  private downloadRawFile(
+    content: string, 
+    fileName: string, 
+    contentType: string = 'text/plain'
+  ) {
+    // 1. Create a Blob from the raw string
+    const blob = new Blob([content], { type: contentType });
+
+    // 2. Create a temporary URL pointing to that Blob
+    const url = window.URL.createObjectURL(blob);
+
+    // 3. Create a hidden 'a' element
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = fileName;
+
+    // 4. Append to body, click it, and remove it
+    document.body.appendChild(link);
+    link.click();
+    
+    // Clean up
+    document.body.removeChild(link);
+    window.URL.revokeObjectURL(url);
+  }
+
   private validate() {
     // optimize wasm module (default passes crash binaryen.js)
+    if(!this.downloaded) {
+      this.downloaded = true;
+      //this.downloadRawFile(this.bmod.emitText(), "debug.wat");
+    }
     if (this.optimize) {
       var size = this.bmod.emitBinary().length;
       // TODO: more passes?
@@ -502,21 +538,29 @@ export class HDLModuleWASM implements HDLModuleRunner {
   private genFunction(block: HDLBlock) {
     // TODO: cfuncs only
     var fnname = block.name;
-    if(VERILATOR_UNIT_FUNCTIONS.includes(fnname)) return; // TODO: Not adding this?
     // find locals of function
     var fscope = new Struct();
     fscope.addEntry(GLOBAL, 4, binaryen.i32, undefined, true); // 1st param to function
-    // add __req local if change_request function
-    if (this.funcResult(block.name) == binaryen.i32) {
+    // add __req local if change_request function (NOTE: OBSOLETE)
+    if (block.name.startsWith('_change_request')) {
       fscope.addEntry(CHANGEDET, 1, binaryen.i32, undefined, false);
     }
+    var args = [binaryen.i32] // pass dataptr()
     this.pushScope(fscope);
     block.exprs.forEach((e) => {
       if (e && isVarDecl(e)) {
-        // TODO: IMPORTANT: Vars with args are not recognized. Put it them as global
         // TODO: make local reference types, instead of promoting local arrays to global
-        if (isReferenceType(e.dtype) || e.isParam) {
+        if (isReferenceType(e.dtype)) {
           this.globals.addVar(e);
+        } else if (e.isParam) {
+          var size = getDataTypeSize(e.dtype);
+          var typ = getBinaryenType(size);
+          if(typ != binaryen.none) {
+            fscope.addEntry(e.name, size, typ, undefined, true);
+            args.push(typ)
+          } else {
+            throw new HDLError(e, "we cannot support arguments other than 32 and 64 bits")
+          }
         } else {
           fscope.addVar(e);
         }
@@ -525,8 +569,8 @@ export class HDLModuleWASM implements HDLModuleRunner {
     // create function body
     var fbody = this.block2wasm(block, { funcblock: block });
     //var fbody = this.bmod.return(this.bmod.i32.const(0));
-    var fret = this.funcResult(block.name);
-    var fsig = binaryen.createType([binaryen.i32]); // pass dataptr()
+    var fret = this.funcResult(block);
+    var fsig = binaryen.createType(args); // pass dataptr()
     var fref = this.bmod.addFunction(fnname, fsig, fret, fscope.getLocals(), fbody);
     this.popScope();
   }
@@ -895,26 +939,63 @@ export class HDLModuleWASM implements HDLModuleRunner {
   private makeTickFuncBody(count: number): number {
     var dseg = this.bmod.local.get(0, binaryen.i32);
     if (count > this.maxEvalIterations) return this.bmod.i32.const(count);
-    return this.bmod.block(
+    return this.bmod.return(this.bmod.i32.const(9)) /*this.bmod.block(
       null,
       [
         this.bmod.call('_eval', [dseg], binaryen.none),
         this.bmod.if(
-          this.bmod.call('_change_request', [dseg], binaryen.i32),
+          //this.bmod.call('_change_request', [dseg], binaryen.i32),
           this.makeTickFuncBody(count + 1),
           this.bmod.return(this.bmod.local.get(0, binaryen.i32)),
         ),
       ],
       binaryen.i32,
-    );
+    );*/
   }
 
-  private funcResult(funcname: string) {
-    // only _change functions return a result
-    if (funcname.startsWith('_change_request')) return binaryen.i32;
-    else if (funcname == '$time') return binaryen.i64;
-    else if (funcname == '$rand') return binaryen.i32;
-    else return binaryen.none;
+  private funcResultExpr(e: HDLExpr): any {
+    // Similar to e2w, but for searching the result if exists
+    if (e == null) {
+      return binaryen.none;
+    } else if (isBlock(e)) {
+      return this.funcResult(e)
+    } else if (isWhileop(e)) {
+      return this.funcResultExpr(e.body)
+    } else if (isVarDecl(e) || isVarRef(e) || isConstExpr(e) || isBigConstExpr(e) || 
+               isBinop(e) || isTriop(e) || isFuncCall(e)) {
+      return binaryen.none;
+    } else if (isUnop(e)) {
+      if(e.op == "creturn") return binaryen.i32;
+      return binaryen.none;
+    } else {
+      throw new HDLError(e, `could not determine for funcResultExpr expr`);
+    }
+  }
+
+  private funcResult(func: HDLBlock) {
+    if(func.name) {
+      if (func.name.startsWith('_change_request')) return binaryen.i32;
+      else if (func.name == '$time') return binaryen.i64;
+      else if (func.name == '$rand') return binaryen.i32;
+    }
+    let ret = binaryen.none
+    for(const e of func.exprs) {
+      const res = this.funcResultExpr(e)
+      if(res != binaryen.none) {
+        ret = res
+        return ret; // NOTE: No idea if ts actually returns the "for" or the "function"
+      }
+    }
+    return ret;
+  }
+  private funcResultByName(e: HDLFuncCall) {
+    for (var block of this.hdlmod.blocks) {
+      if(e.funcname == block.name) {
+        return this.funcResult(block);
+      }
+    }
+    throw new HDLError(e, `The function ${e.funcname} does not exist`);
+    return binaryen.none
   }
 
   private pushScope(scope: Struct) {
@@ -975,9 +1056,9 @@ export class HDLModuleWASM implements HDLModuleRunner {
 
   block2wasm(e: HDLBlock, opts?: Options): number {
     var stmts = e.exprs.map((stmt) => this.e2w(stmt));
-    var ret = opts && opts.funcblock ? this.funcResult(opts.funcblock.name) : binaryen.none;
+    var ret = opts && opts.funcblock ? this.funcResult(opts.funcblock) : binaryen.none;
     // must have return value for change_request function
-    if (ret == binaryen.i32) {
+    if (opts && opts.funcblock && opts.funcblock.name && opts.funcblock.name.startsWith('_change_request') ) {
       stmts.push(this.bmod.return(this.bmod.local.get(this.locals.lookup(CHANGEDET).index, ret)));
     }
     // return block value for loop condition
@@ -999,7 +1080,7 @@ export class HDLModuleWASM implements HDLModuleRunner {
       }
       internal += '_' + (args.length - 1);
     }
-    var ret = this.funcResult(e.funcname);
+    var ret = this.funcResultByName(e);
     return this.bmod.call(internal, args, ret);
   }
 
@@ -2145,17 +2226,27 @@ export class HDLModuleWASM implements HDLModuleRunner {
     }
   }
 
-  address2wasm(e: HDLExpr): number {
+  address2wasm(e: HDLExpr, opts: Options = {}): number {
     if (isBinop(e) && (e.op == 'arraysel' || e.op == 'wordsel')) {
       var elsize =
         e.op == 'wordsel' ? getDataTypeSize(e.dtype) : getArrayElementSizeFromExpr(e.left);
-      var array = this.address2wasm(e.left);
+      var array = this.address2wasm(e.left, {resulttype: binaryen.i32});
       var index = this.e2w(e.right);
       return this.bmod.i32.add(array, this.bmod.i32.mul(this.bmod.i32.const(elsize), index));
     } else if (isVarRef(e)) {
       var local = this.locals && this.locals.lookup(e.refname);
+      var param = this.locals && this.locals.lookparam(e.refname);
       var global = this.globals.lookup(e.refname);
-      if (local != null) {
+      if (param) {
+        var orig = getBinaryenType(param.size)
+        var siz = (opts && opts.resulttype) ? opts.resulttype: getBinaryenType(param.size)
+        if(siz == binaryen.i64 && orig == binaryen.i32) {
+          return this.bmod.i64.extend_u(this.bmod.local.get(param.offset, orig))
+        } else if(siz == binaryen.i32 && orig == binaryen.i64) {
+          return this.bmod.i32.wrap(this.bmod.local.get(param.offset, orig))
+        }
+        return this.bmod.local.get(param.offset, siz);// ().get param.offset
+      } if (local != null) {
         throw new HDLError(e, `can't get array local address yet`);
       } else if (global != null) {
         return this.bmod.i32.const(global.offset);
@@ -2311,7 +2402,7 @@ export class HDLModuleWASM implements HDLModuleRunner {
 
   _stmtexpr2wasm(e: HDLUnop, opts: Options) {
     // Handles calls, and also
-    return this.bmod.return(this.e2w(e.left, opts));
+    return this.e2w(e.left, opts);
   }
 
   _not2wasm(e: HDLUnop, opts: Options) {
