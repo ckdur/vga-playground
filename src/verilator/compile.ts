@@ -118,8 +118,13 @@ export async function compileVerilator(opts: ICompileOptions) {
   const jsonParser = new VerilogJSONParser();
   try {
     const jsonContent = FS.readFile(jsonPath, { encoding: 'utf8' });
-    //downloadRawFile(xmlContent, `V${opts.topModule}.xml`);
-    jsonParser.parse(jsonContent);
+    try {
+      jsonParser.parse(jsonContent);
+    }
+    catch (e) {
+      downloadRawFile(jsonContent, `V${opts.topModule}.json`);
+      throw e
+    }
   } catch (e) {
     console.log(e, (e as Error).stack);
 

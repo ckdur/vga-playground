@@ -307,15 +307,42 @@ export class VerilogJSONParser implements HDLUnit {
   }
 
   visit_initarray(node: JSONNode): HDLBlock {
+
+    const parseFirstIndex = (text: string): string | null => {
+      const match = text.match(/^\s*\[([^\]]+)\]/);
+      return match ? match[1] : null;
+    };
+    // obtain our first index (we only support this)
+    var indexstr = parseFirstIndex(node.attrs["initList"]);
+    var index = indexstr ? parseInt(indexstr):0;
     // Pre-filter out the defaultp
+    var defaultp = node.children.filter((x) => x.attrs["JSONfrom"] == "defaultp")
     node.children = node.children.filter((x) => x.attrs["JSONfrom"] != "defaultp")
+
+    node.children.forEach((x: JSONNode) => {
+      x.attrs["JSONindex"] = String(parseInt(x.attrs["JSONindex"])+index)
+      x.obj.index = x.obj.index+index  // Granted that is a inititem
+    })
+    // TODO: Extend this default not only to the beginning, but also the end
+    for (let i = 0; i < index; i++) {
+      // Encapsulate the defaultp into an initarray
+      var inititem: JSONNode = {
+        type: "inititem",
+        text: "",
+        children: [defaultp[0]],
+        attrs: {JSONindex: String(i)},
+        obj: null
+      }
+      inititem.obj = this.visit_inititem(inititem)
+      node.children.push(inititem)
+    } 
     return this.visit_begin(node);
   }
 
   visit_inititem(node: JSONNode): HDLArrayItem {
     this.expectChildren(node, 1, 1);
     return {
-      index: parseInt(node.attrs['index']),
+      index: parseInt(node.attrs['JSONindex']),
       expr: node.children[0].obj,
     };
   }
@@ -766,10 +793,16 @@ export class VerilogJSONParser implements HDLUnit {
   visit_shiftl(node: JSONNode) {
     return this.__visit_binop(node);
   }
+  visit_shiftlovr(node: JSONNode) {
+    return this.__visit_binop(node);
+  }
   visit_shiftr(node: JSONNode) {
     return this.__visit_binop(node);
   }
   visit_shiftrs(node: JSONNode) {
+    return this.__visit_binop(node);
+  }
+  visit_shiftrovr(node: JSONNode) {
     return this.__visit_binop(node);
   }
 
@@ -861,6 +894,11 @@ export class VerilogJSONParser implements HDLUnit {
   }
 
   visit_textblock(node: JSONNode) {
+    // TODO
+    return null;
+  }
+
+  visit_classrefdtype(node: JSONNode) {
     // TODO
     return null;
   }

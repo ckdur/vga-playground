@@ -1,4 +1,14 @@
-import { SourceLocation } from './emu';
+import { SourceLocation, EmuHalt } from './emu';
+
+export class HDLError extends EmuHalt {
+  obj: any;
+  constructor(obj: any, msg: string) {
+    super(msg, obj ? obj.$loc : null);
+    Object.setPrototypeOf(this, HDLError.prototype);
+    this.obj = obj;
+    if (obj) console.log(obj);
+  }
+}
 
 export interface HDLModuleRunner {
   state: any; // live state or proxy object

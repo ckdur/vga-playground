@@ -1,5 +1,4 @@
 import binaryen from 'binaryen';
-import { HDLError } from './hdlruntime';
 import {
   hasDataType,
   HDLBinop,
@@ -32,6 +31,7 @@ import {
   isVarRef,
   isWhileop,
   isBit,
+  HDLError,
 } from './hdltypes';
 
 const VERILATOR_UNIT_FUNCTIONS = [
@@ -133,7 +133,12 @@ function getBinaryenType(size: number) {
  * Check if a data type is wider than 64 bits
  */
 function isWideType(dt: HDLDataType): boolean {
-  return isLogicType(dt) && dt.left > 63;
+  if(isLogicType(dt))
+    return dt.left > 63
+  if(isArrayType(dt)) {
+    return getDataTypeSize(dt) > 8
+  }
+  return false; // everything else is not
 }
 
 /**
@@ -142,6 +147,9 @@ function isWideType(dt: HDLDataType): boolean {
 function getNumChunks(dt: HDLDataType): number {
   if (isLogicType(dt)) {
     return Math.ceil((dt.left + 1) / 32);
+  }
+  if (isArrayType(dt)) {
+    return Math.ceil(getDataTypeSize(dt) / 4)
   }
   throw new HDLError(dt, `cannot get chunk count for non-logic type`);
 }
@@ -265,7 +273,7 @@ export class HDLModuleWASM implements HDLModuleRunner {
   stopped!: boolean;
   resetStartTimeMsec!: number;
 
-  downloaded: boolean = false;
+  rawwasm!: string
 
   _tick2!: (ofs: number, iters: number) => void;
 
@@ -310,11 +318,10 @@ export class HDLModuleWASM implements HDLModuleRunner {
     for (var i = 0; i < 100; i++) {
       (this.instance.exports as any)._eval_settle(GLOBALOFS);
       (this.instance.exports as any)._eval(GLOBALOFS);
-      var VstlPhaseResult = (this.instance.exports as any)._eval_phase__stl(GLOBALOFS);
-      if (!VstlPhaseResult) {
+      /*var VstlPhaseResult = (this.instance.exports as any)._eval_phase__stl(GLOBALOFS);
+      if (!VstlPhaseResult) {*/
         return;
-      }
-      /**/
+      //}
     }
     throw new HDLError(null, `model did not converge on reset()`);
   }
@@ -483,37 +490,9 @@ export class HDLModuleWASM implements HDLModuleRunner {
     this.addImportedFunctions();
   }
 
-  private downloadRawFile(
-    content: string, 
-    fileName: string, 
-    contentType: string = 'text/plain'
-  ) {
-    // 1. Create a Blob from the raw string
-    const blob = new Blob([content], { type: contentType });
-
-    // 2. Create a temporary URL pointing to that Blob
-    const url = window.URL.createObjectURL(blob);
-
-    // 3. Create a hidden 'a' element
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = fileName;
-
-    // 4. Append to body, click it, and remove it
-    document.body.appendChild(link);
-    link.click();
-    
-    // Clean up
-    document.body.removeChild(link);
-    window.URL.revokeObjectURL(url);
-  }
-
   private validate() {
     // optimize wasm module (default passes crash binaryen.js)
-    if(!this.downloaded) {
-      this.downloaded = true;
-      //this.downloadRawFile(this.bmod.emitText(), "debug.wat");
-    }
+    this.rawwasm = this.bmod.emitText();  // For debugging purposes
     if (this.optimize) {
       var size = this.bmod.emitBinary().length;
       // TODO: more passes?
@@ -740,6 +719,10 @@ export class HDLModuleWASM implements HDLModuleRunner {
     this.addCopyTraceRecFunction();
     this.addEvalFunction();
     this.addTick2Function();
+    this.make_V1Unpacked_loadbit_i32();
+    this.make_V1Unpacked_loadbit_i64();
+    this.make_V1Unpacked_storebit_i32();
+    this.make_V1Unpacked_storebit_i64();
   }
 
   private addImportedFunctions() {
@@ -951,11 +934,12 @@ export class HDLModuleWASM implements HDLModuleRunner {
       null,
       [
         this.bmod.call('_eval', [dseg], binaryen.none),
-        this.bmod.if(
+        this.bmod.return(this.bmod.local.get(0, binaryen.i32))
+        /*this.bmod.if(
           this.bmod.call('_eval_phase__stl', [dseg], binaryen.i32),
           this.makeTickFuncBody(count + 1),
           this.bmod.return(this.bmod.local.get(0, binaryen.i32)),
-        ),
+        ),*/
       ],
       binaryen.i32,
     );
@@ -1100,7 +1084,7 @@ export class HDLModuleWASM implements HDLModuleRunner {
         let low = e.bigvalue & BigInt(0xffffffff);
         let high = (e.bigvalue >> BigInt(32)) & BigInt(0xffffffff);
         return this.i3264(e.dtype).const(Number(low), Number(high));
-      } else if (size <= 4 || (isArrayType(e.dtype) && e.origWidth == 32)) return this.bmod.i32.const(e.cvalue | 0);
+      } else if (size <= 4) return this.bmod.i32.const(e.cvalue | 0);
       else if (size <= 8) return this.bmod.i64.const(e.cvalue | 0, 0);
       else
         throw new HDLError(e, `constants > 64 bits not supported`);
@@ -1140,7 +1124,7 @@ export class HDLModuleWASM implements HDLModuleRunner {
     // Check if this is a wide type assignment
     if (hasDataType(dest) && isWideType(dest.dtype)) {
       return this.wideAssign2wasm(dest, src);
-    }
+    } 
 
     var value = this.e2w(src);
     if (isVarRef(dest)) {
@@ -1152,18 +1136,34 @@ export class HDLModuleWASM implements HDLModuleRunner {
         return this.storemem(dest, this.dataptr(), global.offset, global.size, value);
       }
     } else if (isBinop(dest)) {
-      if((dest.op == 'arraysel' || dest.op == 'wordsel') && isBit(getArrayValueType(dest.left))) {
+      if(false/*(dest.op == 'arraysel' || dest.op == 'wordsel') && isBit(getArrayValueType(dest.left))*/) {
         // Meaning we need to extract a single bit of the "array"
         var elsize =
           dest.op == 'wordsel' ? getDataTypeSize(dest.dtype) : getArrayElementSizeFromExpr(dest.left);
         var array = this.address2wasm(dest.left, {resulttype: binaryen.i32});
-        var right = this.address2wasm(dest.right, {resulttype: binaryen.i32});
-        var index = this.bmod.i32.div_u(right, this.bmod.i32.const(elsize));
-        var addr = this.bmod.i32.add(array, this.bmod.i32.mul(this.bmod.i32.const(elsize), index));
-        var rightb = this.address2wasm(dest.right, {resulttype: elsize <= 4 ? binaryen.i32: binaryen.i64});
-        var ret = this.loadmem(dest, addr, 0, elsize);
-        var newval = this.putbit(dest, ret, rightb, elsize, value)
-        return this.storemem(dest, addr, 0, elsize, newval);
+        var right = this.address2wasm(dest.right, {resulttype: elsize <= 4 ? binaryen.i32: binaryen.i64});
+        if(elsize <= 4) {
+          return this.bmod.call(
+            "V1Unpacked_storebit_i32", 
+            [
+              this.dataptr(),
+              array,
+              right,
+              value,
+              this.bmod.i32.const(elsize)
+            ],
+            binaryen.none)
+        } else {
+          return this.bmod.call(
+            "V1Unpacked_storebit_i64", 
+            [
+              this.dataptr(),
+              array,
+              right,
+              value,
+            ],
+            binaryen.none)
+        }
       }
       var addr = this.address2wasm(dest);
       var elsize =
@@ -1178,7 +1178,7 @@ export class HDLModuleWASM implements HDLModuleRunner {
    * Wide types are stored in memory as arrays of 32-bit chunks.
    */
   wideAssign2wasm(dest: HDLExpr, src: HDLExpr): number {
-    if (!hasDataType(dest) || !isLogicType(dest.dtype)) {
+    if (!hasDataType(dest) || (!isLogicType(dest.dtype) && !isArrayType(dest.dtype))) {
       throw new HDLError(dest, `wide assign requires logic type destination`);
     }
 
@@ -1260,10 +1260,10 @@ export class HDLModuleWASM implements HDLModuleRunner {
     }
 
     // Check for shift operations
-    if (op === 'shiftl') {
+    if (op === 'shiftl' || op === 'shiftlovr') {
       return this.wideShiftLeft(e, destAddr, numChunks);
     }
-    if (op === 'shiftr') {
+    if (op === 'shiftr' || op === 'shiftrovr') {
       return this.wideShiftRight(e, destAddr, numChunks, false);
     }
     if (op === 'shiftrs') {
@@ -2232,45 +2232,45 @@ export class HDLModuleWASM implements HDLModuleRunner {
     }
   }
 
-  putbit(e: HDLSourceObject, ptr: number, offset: number, size: number, value: number): number {
-  if (size <= 4) {
-    // 1. Shift the 1-bit value to the target offset
-    const shiftedVal = this.bmod.i32.shl(
-      this.bmod.i32.and(value, this.bmod.i32.const(1)), // Ensure value is only 1 bit
-      this.bmod.i32.and(offset, this.bmod.i32.const(31))
-    );
+  putbit(ptr: number, offset: number, size: number, value: number): number {
+    if (size <= 4) {
+      // 1. Shift the 1-bit value to the target offset
+      const shiftedVal = this.bmod.i32.shl(
+        this.bmod.i32.and(value, this.bmod.i32.const(1)), // Ensure value is only 1 bit
+        this.bmod.i32.and(offset, this.bmod.i32.const(31))
+      );
 
-    // 2. Create a mask to clear the bit: ~(1 << offset)
-    const mask = this.bmod.i32.xor(
-      this.bmod.i32.shl(this.bmod.i32.const(1), this.bmod.i32.and(offset, this.bmod.i32.const(31))),
-      this.bmod.i32.const(-1) // -1 is 0xFFFFFFFF, effectively a bitwise NOT
-    );
+      // 2. Create a mask to clear the bit: ~(1 << offset)
+      const mask = this.bmod.i32.xor(
+        this.bmod.i32.shl(this.bmod.i32.const(1), this.bmod.i32.and(offset, this.bmod.i32.const(31))),
+        this.bmod.i32.const(-1) // -1 is 0xFFFFFFFF, effectively a bitwise NOT
+      );
 
-    // 3. (ptr & mask) | shiftedVal
-    return this.bmod.i32.or(this.bmod.i32.and(ptr, mask), shiftedVal);
+      // 3. (ptr & mask) | shiftedVal
+      return this.bmod.i32.or(this.bmod.i32.and(ptr, mask), shiftedVal);
 
-  } else if (size <= 8) {
-    // Binaryen i64 constants require (low, high) parts
-    const offsetConst = this.bmod.i64.and(offset, this.bmod.i64.const(63, 0));
-    
-    const shiftedVal = this.bmod.i64.shl(
-      this.bmod.i64.and(value, this.bmod.i64.const(1, 0)),
-      offsetConst
-    );
+    } else if (size <= 8) {
+      // Binaryen i64 constants require (low, high) parts
+      const offsetConst = this.bmod.i64.and(offset, this.bmod.i64.const(63, 0));
+      
+      const shiftedVal = this.bmod.i64.shl(
+        this.bmod.i64.and(value, this.bmod.i64.const(1, 0)),
+        offsetConst
+      );
 
-    const mask = this.bmod.i64.xor(
-      this.bmod.i64.shl(this.bmod.i64.const(1, 0), offsetConst),
-      this.bmod.i64.const(-1, -1) // 64-bit bitwise NOT
-    );
+      const mask = this.bmod.i64.xor(
+        this.bmod.i64.shl(this.bmod.i64.const(1, 0), offsetConst),
+        this.bmod.i64.const(-1, -1) // 64-bit bitwise NOT
+      );
 
-    return this.bmod.i64.or(this.bmod.i64.and(ptr, mask), shiftedVal);
+      return this.bmod.i64.or(this.bmod.i64.and(ptr, mask), shiftedVal);
 
-  } else {
-    throw new HDLError(e, `cannot putbit ${size} bytes (> 64 bits not supported)`);
+    } else {
+      return this.bmod.nop()
+    }
   }
-}
 
-  subbit(e: HDLSourceObject, ptr: number, offset: number, size: number): number {
+  subbit(ptr: number, offset: number, size: number): number {
     if (size <= 4) {
       return this.bmod.i32.and(
         this.bmod.i32.shr_u(ptr, this.bmod.i32.and(offset, this.bmod.i32.const(31))), this.bmod.i32.const(1));
@@ -2278,8 +2278,234 @@ export class HDLModuleWASM implements HDLModuleRunner {
       return this.bmod.i64.and(
         this.bmod.i64.shr_u(ptr, this.bmod.i64.and(offset, this.bmod.i64.const(63, 0))), this.bmod.i64.const(1, 0));
     } else {
-      throw new HDLError(e, `cannot subbit ${size} bytes (> 64 bits not supported)`);
+      return this.bmod.nop()
     }
+  }
+
+  private make_V1Unpacked_loadbit_i32() {
+    const dat = this.bmod.local.get(0, binaryen.i32);
+    const array = this.bmod.local.get(1, binaryen.i32);
+    const right = this.bmod.local.get(2, binaryen.i32);
+    const elsize = this.bmod.local.get(3, binaryen.i32);
+    const index = this.bmod.local.get(4, binaryen.i32);
+    const data = this.bmod.local.get(5, binaryen.i32);
+    var block = this.bmod.block(null,
+      [
+        this.bmod.local.set( // Calc the offset
+          4, // to index
+          this.bmod.i32.add(
+            array,
+            this.bmod.i32.and(
+              right, 
+              this.bmod.i32.xor(
+                this.bmod.i32.sub(elsize, this.bmod.i32.const(-1)),
+                this.bmod.i32.const(-1)
+              )
+            )
+          )
+        ),
+        this.bmod.if( // Obtain the raw bits
+          this.bmod.i32.eq(elsize, this.bmod.i32.const(1)),
+          this.bmod.local.set( 
+            5, // to data
+            this.bmod.i32.load8_u(0, 1, index)
+          ),
+          this.bmod.if(
+            this.bmod.i32.eq(elsize, this.bmod.i32.const(2)),
+            this.bmod.local.set(
+              5, // to data
+              this.bmod.i32.load16_u(0, 2, index)
+            ),
+            this.bmod.local.set(
+              5, // to data
+              this.bmod.i32.load(0, 4, index)
+            )
+          ),
+        ),
+        this.bmod.return(
+          this.subbit(data, right, 4)
+        )
+      ]
+    )
+    this.bmod.addFunction(
+      'V1Unpacked_loadbit_i32', 
+      binaryen.createType([
+        binaryen.i32, // 0 dat
+        binaryen.i32, // 1 base_addr
+        binaryen.i32, // 2 index
+        binaryen.i32, // 3 element size
+      ]),
+      binaryen.i32,
+      [
+        binaryen.i32, // 4 For calc off address
+        binaryen.i32, // 5 For data
+      ], 
+      block,
+    )
+    this.bmod.addFunctionExport('V1Unpacked_loadbit_i32', 'V1Unpacked_loadbit_i32');
+  }
+
+  private make_V1Unpacked_loadbit_i64() {
+    const dat = this.bmod.local.get(0, binaryen.i32);
+    const array = this.bmod.local.get(1, binaryen.i32);
+    const right = this.bmod.local.get(2, binaryen.i64);
+    const index = this.bmod.local.get(3, binaryen.i32);
+    const data = this.bmod.local.get(4, binaryen.i64);
+    var block = this.bmod.block(null,
+      [
+        this.bmod.local.set( // Calc the offset
+          3, // to index
+          this.bmod.i32.add(
+            array,
+            this.bmod.i32.and(
+              this.bmod.i32.wrap(right), 
+              this.bmod.i32.const(0xFFFFFFF8))
+          )
+        ),
+        this.bmod.local.set( // Obtain the raw bits
+          4, // to data
+          this.bmod.i64.load(0, 8, index)),
+        this.bmod.return(
+          this.subbit(data, right, 8)
+        )
+      ]
+    )
+    this.bmod.addFunction(
+      'V1Unpacked_loadbit_i64', 
+      binaryen.createType([
+        binaryen.i32, // 0 dat
+        binaryen.i32, // 1 base_addr
+        binaryen.i64, // 2 right
+      ]),
+      binaryen.i64,
+      [
+        binaryen.i32, // 3 For index
+        binaryen.i64, // 4 For data
+      ], 
+      block,
+    )
+    this.bmod.addFunctionExport('V1Unpacked_loadbit_i64', 'V1Unpacked_loadbit_i64');
+  }
+
+  private make_V1Unpacked_storebit_i32() {
+    const dat = this.bmod.local.get(0, binaryen.i32);
+    const array = this.bmod.local.get(1, binaryen.i32);
+    const right = this.bmod.local.get(2, binaryen.i32);
+    const value = this.bmod.local.get(3, binaryen.i32);
+    const elsize = this.bmod.local.get(4, binaryen.i32);
+    const index = this.bmod.local.get(5, binaryen.i32);
+    const data = this.bmod.local.get(6, binaryen.i32);
+    var block = this.bmod.block(null,
+      [
+        this.bmod.local.set( // Calc the offset
+          5, // to index
+          this.bmod.i32.add(
+            array,
+            this.bmod.i32.and(
+              right, 
+              this.bmod.i32.xor(
+                this.bmod.i32.sub(elsize, this.bmod.i32.const(-1)),
+                this.bmod.i32.const(-1)
+              )
+            )
+          )
+        ),
+        this.bmod.if( // Obtain the raw bits
+          this.bmod.i32.eq(elsize, this.bmod.i32.const(1)),
+          this.bmod.local.set( 
+            6, // to data
+            this.bmod.i32.load8_u(0, 1, index)
+          ),
+          this.bmod.if(
+            this.bmod.i32.eq(elsize, this.bmod.i32.const(2)),
+            this.bmod.local.set(
+              6, // to data
+              this.bmod.i32.load16_u(0, 2, index)
+            ),
+            this.bmod.local.set(
+              6, // to data
+              this.bmod.i32.load(0, 4, index)
+            )
+          ),
+        ),
+        this.bmod.local.set( // Put the bit
+          6, // To data
+          this.putbit(data, right, 4, value),
+        ),
+        this.bmod.if( // Put the result to bits
+          this.bmod.i32.eq(elsize, this.bmod.i32.const(1)),
+          this.bmod.i32.store8(0, 1, index, data),
+          this.bmod.if(
+            this.bmod.i32.eq(elsize, this.bmod.i32.const(2)),
+            this.bmod.i32.store16(0, 2, index, data),
+            this.bmod.i32.store(0, 4, index, data)
+          ),
+        ),
+      ]
+    )
+    this.bmod.addFunction(
+      'V1Unpacked_storebit_i32', 
+      binaryen.createType([
+        binaryen.i32, // 0 dat
+        binaryen.i32, // 1 base_addr
+        binaryen.i32, // 2 index
+        binaryen.i32, // 3 value
+        binaryen.i32, // 4 element size
+      ]),
+      binaryen.none,
+      [
+        binaryen.i32, // 5 For calc off address
+        binaryen.i32, // 6 For data
+      ], 
+      block,
+    )
+    this.bmod.addFunctionExport('V1Unpacked_storebit_i32', 'V1Unpacked_storebit_i32');
+  }
+
+  private make_V1Unpacked_storebit_i64() {
+    const dat = this.bmod.local.get(0, binaryen.i32);
+    const array = this.bmod.local.get(1, binaryen.i32);
+    const right = this.bmod.local.get(2, binaryen.i64);
+    const value = this.bmod.local.get(3, binaryen.i64);
+    const index = this.bmod.local.get(4, binaryen.i32);
+    const data = this.bmod.local.get(5, binaryen.i64);
+    var block = this.bmod.block(null,
+      [
+        this.bmod.local.set( // Calc the offset
+          4, // to index
+          this.bmod.i32.add(
+            array,
+            this.bmod.i32.and(
+              this.bmod.i32.wrap(right), 
+              this.bmod.i32.const(0xFFFFFFF8))
+          )
+        ),
+        this.bmod.local.set( // Obtain the raw bits
+          5, // to data
+          this.bmod.i64.load(0, 8, index)),
+        this.bmod.local.set( // Put the bit
+          5, // to data
+          this.putbit(data, right, 8, value),
+        ),
+        this.bmod.i64.store(0, 8, index, data)
+      ]
+    )
+    this.bmod.addFunction(
+      'V1Unpacked_storebit_i64', 
+      binaryen.createType([
+        binaryen.i32, // 0 dat
+        binaryen.i32, // 1 base_addr
+        binaryen.i64, // 2 index
+        binaryen.i64, // 3 value
+      ]),
+      binaryen.none,
+      [
+        binaryen.i32, // 4 For calc off address
+        binaryen.i64, // 5 For data
+      ], 
+      block,
+    )
+    this.bmod.addFunctionExport('V1Unpacked_storebit_i64', 'V1Unpacked_storebit_i64');
   }
 
   loadmem(e: HDLSourceObject, ptr: number, offset: number, size: number): number {
@@ -2297,9 +2523,7 @@ export class HDLModuleWASM implements HDLModuleRunner {
   }
 
   storemem(e: HDLSourceObject, ptr: number, offset: number, size: number, value: number): number {
-    if (e.dtype && isArrayType(e.dtype)) {
-      return this.bmod.nop(); // TODO: FOR NOW IGNORING THIS
-    } else if (size == 1) {
+    if (size == 1) {
       return this.bmod.i32.store8(offset, 1, ptr, value);
     } else if (size == 2) {
       return this.bmod.i32.store16(offset, 2, ptr, value);
@@ -2366,18 +2590,33 @@ export class HDLModuleWASM implements HDLModuleRunner {
   _arraysel2wasm(e: HDLBinop, opts: Options): number {
 
     let ret: number | null = null
-    if(isBit(getArrayValueType(e)) && isBinop(e) && (e.op == 'arraysel' || e.op == 'wordsel')) {
+    if(/*isBit(getArrayValueType(e)) && isBinop(e) && (e.op == 'arraysel' || e.op == 'wordsel')*/false) {
       // Meaning we need to extract a single bit of the "array"
       var elsize =
         e.op == 'wordsel' ? getDataTypeSize(e.dtype) : getArrayElementSizeFromExpr(e.left);
       var array = this.address2wasm(e.left, {resulttype: binaryen.i32});
-      var right = this.address2wasm(e.right, {resulttype: binaryen.i32});
-      var index = this.bmod.i32.div_u(right, this.bmod.i32.const(elsize));
-      var addr = this.bmod.i32.add(array, this.bmod.i32.mul(this.bmod.i32.const(elsize), index));
-      ret = this.loadmem(e, addr, 0, elsize);
-      var rightb = this.address2wasm(e.right, {resulttype: elsize <= 4 ? binaryen.i32: binaryen.i64});
-      ret = this.subbit(e, ret, rightb, elsize)
-      return ret;
+      var right = this.address2wasm(e.right, {resulttype: elsize <= 4 ? binaryen.i32: binaryen.i64});
+
+      if(elsize <= 4) {
+        return this.bmod.call(
+          "V1Unpacked_loadbit_i32", 
+          [
+            this.dataptr(),
+            array,
+            right,
+            this.bmod.i32.const(elsize)
+          ],
+          binaryen.i32)
+      } else {
+        return this.bmod.call(
+          "V1Unpacked_loadbit_i64", 
+          [
+            this.dataptr(),
+            array,
+            right,
+          ],
+          binaryen.i64)
+      }
     }
     else {
       var addr = this.address2wasm(e);
@@ -2599,7 +2838,7 @@ export class HDLModuleWASM implements HDLModuleRunner {
     } else throw new HDLError(e, '');
   }
 
-  binop(e: HDLBinop, f_op: (a: number, b: number) => number) {
+  recast_binop(e: HDLBinop): [number, number, HDLDataType | null] {
     var left = this.e2w(e.left);
     var right = this.e2w(e.right);
     var upcast = null;
@@ -2618,6 +2857,11 @@ export class HDLModuleWASM implements HDLModuleRunner {
       } else if (ltype != rtype)
         throw new HDLError(e, `wrong argument sizes ${lsize} and ${rsize}`);
     }
+    return [left, right, upcast]
+  }
+
+  binop(e: HDLBinop, f_op: (a: number, b: number) => number) {
+    var [left, right, upcast] = this.recast_binop(e)
     var rtn = f_op(left, right);
     // if we upcasted, and result is 32 bit, downcast to 32 bits
     if (upcast) {
@@ -2633,7 +2877,15 @@ export class HDLModuleWASM implements HDLModuleRunner {
     return this.binop(e, this.i3264rel(e).and);
   }
   _logand2wasm(e: HDLBinop) {
-    return this.binop(e, this.i3264rel(e).and); // TODO: This is NOT how it is done
+    // Special case where is a && instead of a &
+    var [left, right, upcast] = this.recast_binop(e)
+    left = this.i3264rel(e).ne(left, this.i3264rel(e).const(0, 0));
+    right = this.i3264rel(e).ne(right, this.i3264rel(e).const(0, 0));
+    var rtn = this.i3264rel(e).and(left, right);
+    if (upcast) {
+      rtn = this.castexpr(rtn, upcast, e.dtype);
+    }
+    return rtn;
   }
   _xor2wasm(e: HDLBinop) {
     return this.binop(e, this.i3264rel(e).xor);
@@ -2641,7 +2893,13 @@ export class HDLModuleWASM implements HDLModuleRunner {
   _shiftl2wasm(e: HDLBinop) {
     return this.binop(e, this.i3264rel(e).shl);
   }
+  _shiftlovr2wasm(e: HDLBinop) {
+    return this.binop(e, this.i3264rel(e).shl);
+  }
   _shiftr2wasm(e: HDLBinop) {
+    return this.binop(e, this.i3264rel(e).shr_u);
+  }
+  _shiftrovr2wasm(e: HDLBinop) {
     return this.binop(e, this.i3264rel(e).shr_u);
   }
   _shiftrs2wasm(e: HDLBinop) {

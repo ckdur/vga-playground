@@ -106,8 +106,9 @@ export function parseJSONPoorly(
       for (const p of priority) { 
         const iobj = o[p]
         if(Array.isArray(iobj)) { // An identifiable type to just iterate downwards
-          iobj.forEach((o2: Record<string, any>) => {
+          iobj.forEach((o2: Record<string, any>, index: number) => {
             o2["JSONfrom"] = p
+            o2["JSONindex"] = index
             iterate_object(o2)
           });
         }
@@ -116,8 +117,9 @@ export function parseJSONPoorly(
       for (const p of Object.keys(o)) {
         const iobj = o[p]
         if(!priority.includes(p) && Array.isArray(iobj)) { // Other iterables
-          iobj.forEach((o2: Record<string, any>) => {
+          iobj.forEach((o2: Record<string, any>, index: number) => {
             o2["JSONfrom"] = p
+            o2["JSONindex"] = index
             iterate_object(o2)
           });
         }

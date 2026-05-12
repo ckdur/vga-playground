@@ -1,4 +1,3 @@
-import { EmuHalt } from './emu';
 import {
   HDLBlock,
   HDLDataType,
@@ -21,6 +20,7 @@ import {
   isVarDecl,
   isVarRef,
   isWhileop,
+  HDLError,
 } from './hdltypes';
 import { byteArrayToString, safeExtend } from './util';
 
@@ -31,16 +31,6 @@ interface VerilatorUnit {
   _eval(state: any): void;
   _change_request(state: any): boolean;
   [key: string]: any;
-}
-
-export class HDLError extends EmuHalt {
-  obj: any;
-  constructor(obj: any, msg: string) {
-    super(msg, obj ? obj.$loc : null);
-    Object.setPrototypeOf(this, HDLError.prototype);
-    this.obj = obj;
-    if (obj) console.log(obj);
-  }
 }
 
 export class HDLModuleJS implements HDLModuleRunner {
