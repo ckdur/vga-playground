@@ -1,4 +1,4 @@
-import { SourceLocation, EmuHalt } from './emu';
+import { EmuHalt, SourceLocation } from './emu';
 
 export class HDLError extends EmuHalt {
   obj: any;
@@ -37,7 +37,6 @@ export interface HDLLogicType extends HDLSourceObject {
   left: number;
   right: number;
   signed: boolean;
-  bit: boolean; // True if single bit extractable, false for logic
 }
 
 export interface HDLVlTriggerVecType extends HDLSourceObject {
@@ -69,13 +68,6 @@ export function isArrayType(arg: any): arg is HDLUnpackArray {
     arg.high != null &&
     typeof arg.low.cvalue === 'number' &&
     typeof arg.high.cvalue === 'number'
-  );
-}
-
-export function isBit(arg: any): arg is HDLLogicType {
-  return (
-    arg.bit != null &&
-    arg.bit
   );
 }
 

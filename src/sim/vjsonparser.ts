@@ -13,7 +13,6 @@ import {
   HDLHierarchyDef,
   HDLInstanceDef,
   HDLLogicType,
-  HDLVlTriggerVecType,
   HDLModuleDef,
   HDLNativeType,
   HDLPort,
@@ -30,7 +29,7 @@ import {
   isConstExpr,
   isVarDecl,
 } from './hdltypes';
-import { parseJSONPoorly, JSONNode } from './json';
+import { JSONNode, parseJSONPoorly } from './json';
 
 /**
  * Whaa?
@@ -114,8 +113,8 @@ export class VerilogJSONParser implements HDLUnit {
         return this.cur_loc; // cache last parsed $loc object
       } else {
         const [fileid, line, col, end_line, end_col] = loc.split(/[,:]/);
-        const file = this.files[fileid] ?? fileid
-        const filename = file.filename ?? fileid
+        const file = this.files[fileid] ?? fileid;
+        const filename = file.filename ?? fileid;
         const $loc = {
           hdlfile: file,
           path: filename,
@@ -174,9 +173,8 @@ export class VerilogJSONParser implements HDLUnit {
         // Just try to treat it as a number of 32 bits
         const num = parseInt(s);
         const origWidth = 32;
-        return { value: num, origWidth }
-      }
-      catch {
+        return { value: num, origWidth };
+      } catch {
         throw new CompileError(this.cur_loc, `could not parse constant "${s}"`);
       }
     }
@@ -307,35 +305,34 @@ export class VerilogJSONParser implements HDLUnit {
   }
 
   visit_initarray(node: JSONNode): HDLBlock {
-
     const parseFirstIndex = (text: string): string | null => {
       const match = text.match(/^\s*\[([^\]]+)\]/);
       return match ? match[1] : null;
     };
     // obtain our first index (we only support this)
-    var indexstr = parseFirstIndex(node.attrs["initList"]);
-    var index = indexstr ? parseInt(indexstr):0;
+    var indexstr = parseFirstIndex(node.attrs['initList']);
+    var index = indexstr ? parseInt(indexstr) : 0;
     // Pre-filter out the defaultp
-    var defaultp = node.children.filter((x) => x.attrs["JSONfrom"] == "defaultp")
-    node.children = node.children.filter((x) => x.attrs["JSONfrom"] != "defaultp")
+    var defaultp = node.children.filter((x) => x.attrs['JSONfrom'] == 'defaultp');
+    node.children = node.children.filter((x) => x.attrs['JSONfrom'] != 'defaultp');
 
     node.children.forEach((x: JSONNode) => {
-      x.attrs["JSONindex"] = String(parseInt(x.attrs["JSONindex"])+index)
-      x.obj.index = x.obj.index+index  // Granted that is a inititem
-    })
+      x.attrs['JSONindex'] = String(parseInt(x.attrs['JSONindex']) + index);
+      x.obj.index = x.obj.index + index; // Granted that is a inititem
+    });
     // TODO: Extend this default not only to the beginning, but also the end
     for (let i = 0; i < index; i++) {
       // Encapsulate the defaultp into an initarray
       var inititem: JSONNode = {
-        type: "inititem",
-        text: "",
+        type: 'inititem',
+        text: '',
         children: [defaultp[0]],
-        attrs: {JSONindex: String(i)},
-        obj: null
-      }
-      inititem.obj = this.visit_inititem(inititem)
-      node.children.push(inititem)
-    } 
+        attrs: { JSONindex: String(i) },
+        obj: null,
+      };
+      inititem.obj = this.visit_inititem(inititem);
+      node.children.push(inititem);
+    }
     return this.visit_begin(node);
   }
 
@@ -354,12 +351,12 @@ export class VerilogJSONParser implements HDLUnit {
     const block = this.visit_begin(node);
     block.exprs = [];
     node.children.forEach((n) => {
-      if(n.attrs["JSONfrom"] == "argsp") {
-        if(n.type != "var") return; // Skips assigns with cresets
-        n.attrs["param"] = "true";
+      if (n.attrs['JSONfrom'] == 'argsp') {
+        if (n.type != 'var') return; // Skips assigns with cresets
+        n.attrs['param'] = 'true';
         n.obj.isParam = true;
       }
-      block.exprs.push(n.obj)
+      block.exprs.push(n.obj);
     });
     this.cur_module.blocks.push(block);
     return block;
@@ -464,11 +461,11 @@ export class VerilogJSONParser implements HDLUnit {
   }
 
   parseRange(text: string | undefined): [number, number] {
-    if(!text) {
-      return [0, 0]
+    if (!text) {
+      return [0, 0];
     }
     const [high, low] = text.split(':').map(Number);
-    
+
     return [high, low];
   }
 
@@ -476,10 +473,10 @@ export class VerilogJSONParser implements HDLUnit {
     let id = node.attrs['dtypep'];
     let dtype: HDLDataType;
     const dtypename = node.attrs['name'];
-    let b = true
+    let b = true;
     switch (dtypename) {
       case 'logic':
-        b = false
+        b = false;
       case 'integer': // TODO?
       case 'bit':
         const [msb, lsb] = this.parseRange(node.attrs['range']);
@@ -488,7 +485,7 @@ export class VerilogJSONParser implements HDLUnit {
           left: msb,
           right: lsb,
           signed: node.attrs['signed'] == 'true',
-          bit: b
+          bit: b,
         };
         dtype = dlogic;
         break;
@@ -638,21 +635,21 @@ export class VerilogJSONParser implements HDLUnit {
     // The structure of whiles now is different
     // everything that is not a "LOOPTEST belongs to the body"
     // We need to create a mock node for the body only
-    var node_body: JSONNode = { 
-      type: "begin",
-      text: null, 
-      children: node.children.filter(x => x.type != "looptest"), 
+    var node_body: JSONNode = {
+      type: 'begin',
+      text: null,
+      children: node.children.filter((x) => x.type != 'looptest'),
       attrs: {},
-      obj: null };
+      obj: null,
+    };
     const expr: HDLWhileOp = {
       $loc: this.parseSourceLocation(node),
       op: 'while',
       dtype: null!,
-      precond: node.children[0].type === "looptest" 
-          ? (node.children[0].obj as HDLExpr) 
-          : null!,
-      loopcond: node.children[node.children.length-1].type === "looptest" 
-          ? (node.children[node.children.length-1].obj as HDLExpr) 
+      precond: node.children[0].type === 'looptest' ? (node.children[0].obj as HDLExpr) : null!,
+      loopcond:
+        node.children[node.children.length - 1].type === 'looptest'
+          ? (node.children[node.children.length - 1].obj as HDLExpr)
           : null!,
       body: this.visit_begin(node_body),
       inc: null!, // No more increments
@@ -661,11 +658,11 @@ export class VerilogJSONParser implements HDLUnit {
   }
 
   visit_loop(node: JSONNode): HDLWhileOp {
-    return this.visit_while(node)
+    return this.visit_while(node);
   }
 
   visit_looptest(node: JSONNode) {
-    return this.visit_begin(node)  // Is just another begin
+    return this.visit_begin(node); // Is just another begin
   }
 
   __visit_triop(node: JSONNode): HDLBinop {
@@ -715,15 +712,16 @@ export class VerilogJSONParser implements HDLUnit {
     return this.__visit_unop(node);
   }
   visit_creset(node: JSONNode) {
-    if(node.children.length == 0) {
+    if (node.children.length == 0) {
       // Treat it as a zero constant
-      var elemp_node: JSONNode = { 
-        type: "const", 
-        text: null, 
-        children: [], 
-        attrs: { ...node.attrs }, 
-        obj: null };
-      elemp_node.attrs["name"] = "0";
+      var elemp_node: JSONNode = {
+        type: 'const',
+        text: null,
+        children: [],
+        attrs: { ...node.attrs },
+        obj: null,
+      };
+      elemp_node.attrs['name'] = '0';
       return this.visit_const(elemp_node);
     }
     return this.__visit_unop(node);
@@ -907,22 +905,19 @@ export class VerilogJSONParser implements HDLUnit {
     const name = node.attrs['name'];
     node.type = name; // To propagate to Xop
     // Depends on the name, is the operation
-    if(node.children.length == 1) {
+    if (node.children.length == 1) {
       return this.__visit_unop(node); // One op
-    }
-    else if(node.children.length == 2) {
+    } else if (node.children.length == 2) {
       return this.__visit_binop(node); // Two ops
-    }
-    else if(node.children.length == 3) {
+    } else if (node.children.length == 3) {
       return this.__visit_triop(node); // Three ops
-    }
-    else {
+    } else {
       return; // TODO: No fail?
     }
   }
 
   visit_logand(node: JSONNode) {
-      return this.__visit_binop(node);
+    return this.__visit_binop(node);
   }
 
   visit_voiddtype(node: JSONNode) {

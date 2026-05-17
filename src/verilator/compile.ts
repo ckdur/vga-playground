@@ -1,4 +1,4 @@
-import { VerilogJSONParser } from '../sim/vxmlparser';
+import { VerilogJSONParser } from '../sim/vjsonparser';
 import { ErrorParser } from './ErrorParser';
 import verilated_std_sv from './verilated_std.sv?raw';
 import verilated_std_waiver_vlt from './verilated_std_waiver.vlt?raw';
