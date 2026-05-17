@@ -1,8 +1,7 @@
-import { VerilogJSONParser } from '../sim/vxmlparser';
 import { ErrorParser } from './ErrorParser';
-import verilator_bin from './verilator_bin';
-import verilated_std_waiver_vlt from './verilated_std_waiver.vlt?raw';
 import verilated_std_sv from './verilated_std.sv?raw';
+import verilated_std_waiver_vlt from './verilated_std_waiver.vlt?raw';
+import verilator_bin from './verilator_bin';
 
 let browserWasmBin: ArrayBuffer | null = null;
 
@@ -38,8 +37,8 @@ export async function compileVerilator(opts: ICompileOptions) {
   const { FS } = verilatorInst;
 
   let sourceList: string[] = [];
-  let cwd = FS.cwd()
-  console.log(cwd)
+  let cwd = FS.cwd();
+  console.log(cwd);
   FS.mkdir('src');
   FS.mkdir('/share');
   FS.mkdir('/share/verilator');
@@ -55,17 +54,23 @@ export async function compileVerilator(opts: ICompileOptions) {
     }
   }
   var contents = FS.readdir('/');
-  console.log(contents)
+  console.log(contents);
   const jsonPath = `obj_dir/V${opts.topModule}.tree.json`;
   try {
+    // args = verilator_bin --cc -O3 -Wall -Wno-EOFNEWLINE -Wno-DECLFILENAME -Wno-UNOPTFLAT -Wno-BLKSEQ -Wno-UNDRIVEN -Wno-PINMISSING -Wno-UNUSED -Wno-WIDTHTRUNC --x-assign fast --debug-check --top-module tt_um_vga_example project.v ../common/hvsync_generator.v
     const args = [
       '--cc',
       '-O3',
       '-Wall',
       '-Wno-EOFNEWLINE',
-      '-Wno-DECLFILENAME', 
+      '-Wno-DECLFILENAME',
       // Why do you even care?
-      '-Wno-UNOPTFLAT', '-Wno-BLKSEQ', '-Wno-UNDRIVEN', '-Wno-PINMISSING', '-Wno-UNUSED', '-Wno-WIDTHTRUNC',
+      '-Wno-UNOPTFLAT',
+      '-Wno-BLKSEQ',
+      '-Wno-UNDRIVEN',
+      '-Wno-PINMISSING',
+      '-Wno-UNUSED',
+      '-Wno-WIDTHTRUNC',
       '--x-assign',
       'fast',
       '--debug-check', // for XML output
@@ -90,11 +95,7 @@ export async function compileVerilator(opts: ICompileOptions) {
     return { errors: errorParser.errors };
   }
 
-  function downloadRawFile(
-    content: string, 
-    fileName: string, 
-    contentType: string = 'text/plain'
-  ) {
+  function downloadRawFile(content: string, fileName: string, contentType: string = 'text/plain') {
     // 1. Create a Blob from the raw string
     const blob = new Blob([content], { type: contentType });
 
@@ -109,22 +110,15 @@ export async function compileVerilator(opts: ICompileOptions) {
     // 4. Append to body, click it, and remove it
     document.body.appendChild(link);
     link.click();
-    
+
     // Clean up
     document.body.removeChild(link);
     window.URL.revokeObjectURL(url);
   }
 
-  const jsonParser = new VerilogJSONParser();
+  var jsonContent = null;
   try {
-    const jsonContent = FS.readFile(jsonPath, { encoding: 'utf8' });
-    try {
-      jsonParser.parse(jsonContent);
-    }
-    catch (e) {
-      downloadRawFile(jsonContent, `V${opts.topModule}.json`);
-      throw e
-    }
+    jsonContent = FS.readFile(jsonPath, { encoding: 'utf8' });
   } catch (e) {
     console.log(e, (e as Error).stack);
 
@@ -143,6 +137,6 @@ export async function compileVerilator(opts: ICompileOptions) {
   }
   return {
     errors: errorParser.errors,
-    output: jsonParser,
+    output: jsonContent,
   };
 }
