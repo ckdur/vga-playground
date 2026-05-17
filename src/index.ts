@@ -20,7 +20,7 @@ import {
 import { initErrorOverlay } from './ui/ErrorOverlay';
 import { FileTabs } from './ui/FileTabs';
 import { initPresetBar } from './ui/PresetBar';
-import { compileVerilator } from './verilator/compile';
+import { compileVerilator, downloadRawFile } from './verilator/compile';
 import { detectTopModule } from './verilog';
 
 self.MonacoEnvironment = {
@@ -101,7 +101,7 @@ async function initModule(modules: Record<string, HDLModuleDef>) {
   if (jmod) jmod.dispose();
   let mod = modules['TOP'];
   if (!mod) {
-    mod = modules['$root']
+    mod = modules['$root'];
   }
   jmod = new HDLModuleWASM(mod, modules['@CONST-POOL@']);
   await jmod.init();
@@ -126,6 +126,7 @@ if (res.output) {
   } catch (e) {
     console.log(e, (e as Error).stack);
     errorOverlay.show('Simulation Error', e instanceof Error ? e.message : String(e));
+    downloadRawFile(jmod?.rawwasm ?? '', 'debug.wat');
   }
 } else {
   errorOverlay.showCompileErrors(res.errors);
@@ -202,7 +203,9 @@ editor.onDidChangeModelContent(async () => {
   try {
     await initModule(res.output.modules);
   } catch (e) {
+    console.log(e, (e as Error).stack);
     errorOverlay.show('Simulation Error', e instanceof Error ? e.message : String(e));
+    downloadRawFile(jmod?.rawwasm ?? '', 'debug.wat');
     return;
   }
   fpsCounter.reset();

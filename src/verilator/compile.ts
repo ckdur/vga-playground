@@ -5,6 +5,31 @@ import verilator_bin from './verilator_bin';
 
 let browserWasmBin: ArrayBuffer | null = null;
 
+export function downloadRawFile(
+  content: string,
+  fileName: string,
+  contentType: string = 'text/plain',
+) {
+  // 1. Create a Blob from the raw string
+  const blob = new Blob([content], { type: contentType });
+
+  // 2. Create a temporary URL pointing to that Blob
+  const url = window.URL.createObjectURL(blob);
+
+  // 3. Create a hidden 'a' element
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = fileName;
+
+  // 4. Append to body, click it, and remove it
+  document.body.appendChild(link);
+  link.click();
+
+  // Clean up
+  document.body.removeChild(link);
+  window.URL.revokeObjectURL(url);
+}
+
 export interface ICompileOptions {
   topModule: string;
   sources: Record<string, string>;
@@ -38,7 +63,6 @@ export async function compileVerilator(opts: ICompileOptions) {
 
   let sourceList: string[] = [];
   let cwd = FS.cwd();
-  console.log(cwd);
   FS.mkdir('src');
   FS.mkdir('/share');
   FS.mkdir('/share/verilator');
@@ -93,27 +117,6 @@ export async function compileVerilator(opts: ICompileOptions) {
 
   if (errorParser.errors.filter((e) => e.type === 'error').length) {
     return { errors: errorParser.errors };
-  }
-
-  function downloadRawFile(content: string, fileName: string, contentType: string = 'text/plain') {
-    // 1. Create a Blob from the raw string
-    const blob = new Blob([content], { type: contentType });
-
-    // 2. Create a temporary URL pointing to that Blob
-    const url = window.URL.createObjectURL(blob);
-
-    // 3. Create a hidden 'a' element
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = fileName;
-
-    // 4. Append to body, click it, and remove it
-    document.body.appendChild(link);
-    link.click();
-
-    // Clean up
-    document.body.removeChild(link);
-    window.URL.revokeObjectURL(url);
   }
 
   var jsonContent = null;
