@@ -1,3 +1,4 @@
+import { HDLNetlist } from '../sim/hdltypes.ts';
 import { ErrorParser } from './ErrorParser';
 import verilated_std_sv from './verilated_std.sv?raw';
 import verilated_std_waiver_vlt from './verilated_std_waiver.vlt?raw';
@@ -119,11 +120,17 @@ export async function compileVerilator(opts: ICompileOptions) {
     return { errors: errorParser.errors };
   }
 
-  var jsonContent = null;
+  var jsonContent = '';
+  var json = null;
   try {
     jsonContent = FS.readFile(jsonPath, { encoding: 'utf8' });
+    json = new HDLNetlist(jsonContent);
   } catch (e) {
     console.log(e, (e as Error).stack);
+
+    if (jsonContent != '') {
+      downloadRawFile(jsonContent, `V${opts.topModule}.tree.json`);
+    }
 
     return {
       errors: [
@@ -140,6 +147,6 @@ export async function compileVerilator(opts: ICompileOptions) {
   }
   return {
     errors: errorParser.errors,
-    output: jsonContent,
+    output: json,
   };
 }
