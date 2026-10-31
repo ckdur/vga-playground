@@ -28,6 +28,8 @@ Verilog ──(verilator_bin.wasm, --debug-check)──> V<top>.tree.json
    - the semantics of Verilator's runtime (`verilated_funcs.h`) are followed
      exactly: `x/0 == 0`, shifts by more than the width, `VL_SHIFTRS`,
      `VL_EXTENDS`, signed comparisons using `widthMin`, etc.
+   - `$readmemh`/`$readmemb` load files from the project's `dataFiles`
+     (`readmem.ts`), with Verilator's addressing rules
    - the model is initialized lazily on the first `eval()` (static/initial
      blocks and settle), like `Vtop::eval_step()`, so the inputs set after
      `powercycle()` are seen by `initial` blocks

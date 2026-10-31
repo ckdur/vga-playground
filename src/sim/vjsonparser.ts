@@ -118,7 +118,8 @@ export function parseConstValue(s: string): { value: bigint; width: number | nul
     for (const ch of digits.toLowerCase()) value = value * BigInt(radix) + BigInt(parseInt(ch, 16));
     return { value, width };
   }
-  // String literal (only meaningful for $display & co, which are ignored)
+  // String literal. Verilator dumps them with escaped quotes: \"text\"
+  if (s.startsWith('\\"')) s = s.replace(/\\"/g, '"');
   if (s.startsWith('"')) {
     let str = s.slice(1, -1);
     try {
@@ -539,6 +540,24 @@ export class VerilogJSONParser {
         if (fatal) out.push({ s: 'fatal', msg: fatal[1], loc });
         else if (/VL_FINISH_MT|gotFinish\(true\)/.test(text)) out.push({ s: 'finish', loc });
         else if (/VL_STOP_MT/.test(text)) out.push({ s: 'stop', loc });
+        return;
+      }
+      case 'READMEM': {
+        const fn = n.filenamep[0];
+        const { str } = fn.type === 'CONST' ? parseConstValue(fn.name) : { str: undefined };
+        if (str === undefined) this.fail(n, `$readmem file name must be a constant string`);
+        // isHex is dumped by the patched Verilator; otherwise guess from the extension
+        const isHex =
+          n.isHex !== undefined ? n.isHex === true || n.isHex === 'true' : !str.endsWith('.binary');
+        out.push({
+          s: 'readmem',
+          isHex,
+          filename: str,
+          mem: this.expr(n.memp[0]),
+          start: n.lsbp?.[0] ? this.expr(n.lsbp[0]) : undefined,
+          end: n.msbp?.[0] ? this.expr(n.msbp[0]) : undefined,
+          loc,
+        });
         return;
       }
       case 'FINISH':

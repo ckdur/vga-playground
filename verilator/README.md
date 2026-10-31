@@ -52,7 +52,7 @@ The build was tested with Emscripten 3.1.69 (clang 19) and Verilator
 | `include/verilatedos.h`         | `VL_CPU_RELAX()` has no WASM implementation: make it empty instead of an `#error`. |
 | `include/verilated_threads.cpp` | No `pthread_setaffinity_np` under Emscripten. |
 | `src/Verilator.cpp`             | `main()` is exported (`extern "C"` + `EMSCRIPTEN_KEEPALIVE`) so that `callMain()` works. |
-| `src/V3AstNodes.cpp`            | JSON dump fixes needed by the simulator (see below). |
+| `src/V3AstNodes.cpp`, `src/V3AstNodeStmt.h` | JSON dump fixes needed by the simulator (see below). |
 
 The JSON changes matter for simulation correctness:
 
@@ -65,9 +65,12 @@ The JSON changes matter for simulation correctness:
    `VL_SHIFTRS_WWI(obits=widthMin, ...)`, `VL_LTS_III(lbits=widthMin, ...)`),
    and it can differ from the declared range (a 100 bit result stored in a
    128 bit temporary, for example).
+3. **`isHex` on `READMEM`.** Whether a call is `$readmemh` or `$readmemb` is
+   not dumped upstream.
 
 The simulator still accepts JSON from an unpatched Verilator, but it warns
-about truncated tables and falls back to the declared ranges.
+about truncated tables, falls back to the declared ranges, and guesses
+`$readmemb` from a `.binary` file extension.
 
 ## Building by hand
 

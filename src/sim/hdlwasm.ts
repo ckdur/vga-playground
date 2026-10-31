@@ -33,6 +33,7 @@ import {
   VType,
   VVar,
 } from './hdltypes';
+import { parseMemFile } from './readmem';
 import { helperScratchSize, wasmHelpers } from './wasmlib';
 
 const TRACERECLEN = '$$treclen';
@@ -124,6 +125,13 @@ class Struct {
   }
 }
 
+interface ReadMemInfo {
+  filename: string;
+  isHex: boolean;
+  elemBits: number;
+  line?: number;
+}
+
 interface Options {
   maxMemoryMB?: number;
   /** run the binaryen optimizer (default: true) */
@@ -153,6 +161,7 @@ class WatGen {
   wideConsts = new Map<string, number>();
   funcNames = new Map<string, string>();
   fatalMessages: string[] = [];
+  readmems: ReadMemInfo[] = [];
   maxWords = 2;
   outputbytes = 0;
   statebytes = 0;
@@ -186,6 +195,9 @@ class WatGen {
     lines.push('  (import "builtins" "fatal" (func $__fatal (param i32)))');
     lines.push('  (import "builtins" "time" (func $__time (result i64)))');
     lines.push('  (import "builtins" "random" (func $__random (result i32)))');
+    lines.push(
+      '  (import "builtins" "readmem" (func $__readmem (param i32 i32 i32 i32 i32) (param i32 i32)))',
+    );
     lines.push(`  (memory $mem ${pages} ${pages})`);
     lines.push('  (export "memory" (memory $mem))');
     lines.push(helpers);
@@ -395,6 +407,22 @@ class WatGen {
       case 'fatal': {
         this.fatalMessages.push(s.msg + (s.loc ? ` (line ${s.loc.line})` : ''));
         return `(call $__fatal ${i32c(this.fatalMessages.length - 1)}) (unreachable)`;
+      }
+      case 'readmem': {
+        const mt = s.mem.t;
+        if (!isArray(mt)) throw new HDLError(s, `$readmem destination must be an unpacked array`);
+        if (!isLogic(mt.elem))
+          throw new HDLError(s, `$readmem into multi-dimensional arrays is not supported`);
+        this.readmems.push({
+          filename: s.filename,
+          isHex: s.isHex,
+          elemBits: mt.elem.width,
+          line: s.loc?.line,
+        });
+        // (id, address, element size, element count, declared low index, start, end)
+        const start = s.start ? this.exAs(s.start, 'i32') : i32c(0);
+        const end = s.end ? this.exAs(s.end, 'i32') : i32c(-1);
+        return `(call $__readmem ${i32c(this.readmems.length - 1)} ${this.lvAddr(s.mem)} ${i32c(typeSize(mt.elem))} ${i32c(mt.count)} ${i32c(mt.lo)} ${start} ${end})`;
       }
       case 'finish':
         return `(call $__finish ${i32c(s.loc?.line ?? 0)})`;
@@ -1131,6 +1159,7 @@ export class HDLModuleWASM implements HDLModuleRunner {
   /** WAT source of the generated module (for debugging) */
   wat = '';
   private fatalMessages: string[] = [];
+  private readmems: ReadMemInfo[] = [];
   private wasmBinary!: Uint8Array;
   private _eval!: () => void;
   private _tick2!: (iters: number) => void;
@@ -1157,6 +1186,7 @@ export class HDLModuleWASM implements HDLModuleRunner {
     this.outputbytes = gen.outputbytes;
     this.traceRecordSize = gen.outputbytes;
     this.fatalMessages = gen.fatalMessages;
+    this.readmems = gen.readmems;
     if (gen.globals.len > this.maxMemoryMB * 1024 * 1024) {
       throw new HDLError(
         null,
@@ -1228,8 +1258,66 @@ export class HDLModuleWASM implements HDLModuleRunner {
         },
         time: () => BigInt(Date.now() - this.resetStartTimeMsec),
         random: () => (Math.random() * 4294967296) | 0,
+        readmem: (
+          id: number,
+          addr: number,
+          elemSize: number,
+          count: number,
+          lo: number,
+          start: number,
+          end: number,
+        ) => this.readmem(this.readmems[id], addr, elemSize, count, lo, start, end),
       },
     };
+  }
+
+  /**
+   * $readmemh/$readmemb (VL_READMEM_N): file addresses are Verilog indices of
+   * the destination array, starting at 'start' (default: the low index).
+   */
+  private readmem(
+    info: ReadMemInfo,
+    addr: number,
+    elemSize: number,
+    count: number,
+    lo: number,
+    start: number,
+    end: number,
+  ) {
+    const fn = info.filename;
+    const filedata = this.getFileData?.(fn);
+    if (filedata == null) throw new HDLError(null, `$readmem: no file "${fn}"`);
+    if (typeof filedata !== 'string') {
+      throw new HDLError(
+        null,
+        `$readmem: file "${fn}" must be text (lines of hex or binary values)`,
+      );
+    }
+    // VL_READMEM_N: loading starts at 'start' (at least the low index), '@'
+    // addresses are absolute, the end address is not enforced, and addresses
+    // outside of the array are fatal errors
+    let entries;
+    try {
+      entries = parseMemFile(filedata, info.isHex, Math.max(start, lo));
+    } catch (e) {
+      throw new HDLError(null, `$readmem of "${fn}": ${(e as Error).message}`);
+    }
+    const mask = (1n << BigInt(info.elemBits)) - 1n;
+    for (const e of entries) {
+      const i = e.addr - lo;
+      if (i < 0 || i >= count) {
+        throw new HDLError(
+          null,
+          `$readmem of "${fn}": too much data for destination (${count} elements)`,
+        );
+      }
+      let value = e.value & mask;
+      const ofs = addr + i * elemSize;
+      for (let b = 0; b < elemSize; b++) {
+        this.data8[ofs + b] = Number(value & 0xffn);
+        value >>= 8n;
+      }
+    }
   }
 
   /**

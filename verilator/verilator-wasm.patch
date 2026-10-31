@@ -43,13 +43,31 @@ index b93909309..fe50758f0 100644
  #endif
  
  //=========================================================================
+diff --git a/src/V3AstNodeStmt.h b/src/V3AstNodeStmt.h
+index 37def443a..dc953cc0e 100644
+--- a/src/V3AstNodeStmt.h
++++ b/src/V3AstNodeStmt.h
+@@ -198,6 +198,7 @@ public:
+         return isHex() == VN_DBG_AS(samep, NodeReadWriteMem)->isHex();
+     }
+     bool isHex() const { return m_isHex; }
++    void dumpJson(std::ostream& str) const override;
+     virtual const char* cFuncPrefixp() const = 0;
+ };
+ 
 diff --git a/src/V3AstNodes.cpp b/src/V3AstNodes.cpp
-index f3cede99c..df1bf0b95 100644
+index f3cede99c..77676dd2f 100644
 --- a/src/V3AstNodes.cpp
 +++ b/src/V3AstNodes.cpp
-@@ -2260,8 +2260,14 @@ void AstInitArray::dump(std::ostream& str) const {
+@@ -2259,9 +2259,20 @@ void AstInitArray::dump(std::ostream& str) const {
+     this->AstNode::dump(str);
      dumpInitList(str);
  }
++void AstNodeReadWriteMem::dumpJson(std::ostream& str) const {
++    // $readmemh vs $readmemb (needed by JSON consumers such as vga-playground)
++    dumpJsonStr(str, "isHex", isHex() ? "true" : "false");
++    dumpJsonGen(str);
++}
  void AstInitArray::dumpJson(std::ostream& str) const {
 +    // Emit the complete index map (not truncated like the text dump), so that
 +    // JSON consumers (e.g. vga-playground) can place sparse INITITEMs correctly.
@@ -63,7 +81,7 @@ index f3cede99c..df1bf0b95 100644
      str << '"';
      dumpJsonGen(str);
  }
-@@ -2661,6 +2667,12 @@ void AstNodeDType::dump(std::ostream& str) const {
+@@ -2661,6 +2672,12 @@ void AstNodeDType::dump(std::ostream& str) const {
  void AstNodeDType::dumpJson(std::ostream& str) const {
      dumpJsonBoolFuncIf(str, generic);
      if (isSigned() && !isDouble()) dumpJsonBoolIf(str, "signed", true);

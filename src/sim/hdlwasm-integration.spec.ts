@@ -720,6 +720,173 @@ describe('Full Verilog -> WASM Pipeline', () => {
     });
   });
 
+  describe('$readmemh into small array', () => {
+    test('should pass small (<=8 byte) array as address, not load it as a value', async () => {
+      // Regression: rom array totaling <=8 bytes was being passed by value (i64.load)
+      // to $readmem instead of by address (i32 pointer), breaking wasm validation with
+      // "call param types must match" on argument 2 of $readmem_2.
+      const verilog = `
+        module readmem_small(
+          input wire [2:0] idx,
+          output wire [3:0] val
+        );
+          reg [3:0] pal[0:7];
+          initial begin
+            $readmemh("../data/pal.hex", pal);
+          end
+          assign val = pal[idx];
+        endmodule
+      `;
+
+      const mod = await compileAndCreate('readmem_small', { 'readmem_small.v': verilog });
+      mod.getFileData = () => '0\n1\n2\n3\n4\n5\n6\n7\n';
+      mod.powercycle();
+      mod.state.idx = 5;
+      mod.eval();
+      expect(mod.state.val).toBe(5);
+      mod.dispose();
+    });
+
+    test('should re-clear $readmem filename buffers across powercycles', async () => {
+      // Regression: $readmem filename buffers are promoted to globals past the
+      // trace buffer where clearMutableState wasn't reaching. Filenames whose
+      // length is a multiple of 8 lack a null terminator, so on the second
+      // powercycle the read flowed into a sibling temp's stale bytes.
+      const verilog = `
+        module readmem_repeat(
+          input wire idx,
+          output wire [3:0] val
+        );
+          reg [3:0] a[0:0];
+          reg [3:0] b[0:0];
+          initial begin
+            $readmemh("../data/aaaa.hex", a);
+            $readmemh("../data/bbbb.hex", b);
+          end
+          assign val = idx ? b[0] : a[0];
+        endmodule
+      `;
+      const mod = await compileAndCreate('readmem_repeat', { 'readmem_repeat.v': verilog });
+      const requested: string[] = [];
+      mod.getFileData = (fn: string) => {
+        requested.push(fn);
+        return '5\n';
+      };
+      // initial blocks (and $readmem) run on the first eval() after a powercycle,
+      // like Verilator's eval_step()
+      mod.powercycle();
+      mod.eval();
+      mod.powercycle();
+      mod.eval();
+      expect(requested).toEqual([
+        '../data/aaaa.hex',
+        '../data/bbbb.hex',
+        '../data/aaaa.hex',
+        '../data/bbbb.hex',
+      ]);
+      mod.dispose();
+    });
+
+    test('should load values separated by spaces rather than newlines', async () => {
+      // Regression: the file was split on newlines only, so a memory laid out
+      // as a grid (or on a single line) loaded just the first value of each row.
+      const verilog = `
+        module readmem_grid(
+          input wire [2:0] idx,
+          output wire [3:0] val
+        );
+          reg [3:0] pal[0:7];
+          initial begin
+            $readmemh("../data/pal.hex", pal);
+          end
+          assign val = pal[idx];
+        endmodule
+      `;
+      const mod = await compileAndCreate('readmem_grid', { 'readmem_grid.v': verilog });
+      mod.getFileData = () => '0 1 2 3\n4 5 6 7\n';
+      mod.powercycle();
+      for (let i = 0; i < 8; i++) {
+        mod.state.idx = i;
+        mod.eval();
+        expect(mod.state.val).toBe(i);
+      }
+      mod.dispose();
+    });
+
+    test('should load a memory wider than one byte', async () => {
+      // Regression: values were written one byte apart regardless of the
+      // element size, so a 16-bit memory got truncated and misaligned data.
+      const verilog = `
+        module readmem_wide(
+          input wire [1:0] idx,
+          output wire [15:0] val
+        );
+          reg [15:0] rom[0:3];
+          initial begin
+            $readmemh("../data/rom.hex", rom);
+          end
+          assign val = rom[idx];
+        endmodule
+      `;
+      const mod = await compileAndCreate('readmem_wide', { 'readmem_wide.v': verilog });
+      mod.getFileData = () => '1234 5678 9abc def0';
+      mod.powercycle();
+      for (const [i, expected] of [0x1234, 0x5678, 0x9abc, 0xdef0].entries()) {
+        mod.state.idx = i;
+        mod.eval();
+        expect(mod.state.val).toBe(expected);
+      }
+      mod.dispose();
+    });
+
+    test('should honor $readmemb, start addresses, @addr and non-zero-based arrays', async () => {
+      const verilog = `
+        module readmem_addr(
+          input wire [2:0] idx,
+          output wire [3:0] val
+        );
+          reg [3:0] mem[2:7];
+          initial begin
+            $readmemb("mem.txt", mem, 3);
+          end
+          assign val = (idx >= 2) ? mem[idx] : 4'hf;
+        endmodule
+      `;
+      const mod = await compileAndCreate('readmem_addr', { 'readmem_addr.v': verilog });
+      // binary values, loaded from index 3; @6 is an absolute index;
+      // 11111 is truncated to the 4-bit element width
+      mod.getFileData = () => '// comment\n0001 0010\n@6 11111';
+      mod.powercycle();
+      const got = [2, 3, 4, 5, 6, 7].map((i) => {
+        mod.state.idx = i;
+        mod.eval();
+        return mod.state.val;
+      });
+      expect(got).toEqual([0, 1, 2, 0, 0xf, 0]);
+      mod.dispose();
+    });
+
+    test('should reject a file with more values than the destination holds', async () => {
+      const verilog = `
+        module readmem_overflow(
+          input wire [1:0] idx,
+          output wire [3:0] val
+        );
+          reg [3:0] mem[0:3];
+          initial begin
+            $readmemh("../data/mem.hex", mem);
+          end
+          assign val = mem[idx];
+        endmodule
+      `;
+      const mod = await compileAndCreate('readmem_overflow', { 'readmem_overflow.v': verilog });
+      mod.getFileData = () => '1 2 3 4 5';
+      mod.powercycle();
+      expect(() => mod.eval()).toThrow(/too much data/);
+      mod.dispose();
+    });
+  });
+
   describe('Signed comparisons', () => {
     test('should sign-extend narrower-than-container signed values before comparing', async () => {
       // Reproduces issue #15: $signed(28-bit value) > 28'sh4000

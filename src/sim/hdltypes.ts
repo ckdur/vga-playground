@@ -185,6 +185,16 @@ export type VStmt =
   | { s: 'return'; value?: VExpr; loc?: VSourceLocation }
   | { s: 'expr'; e: VExpr; loc?: VSourceLocation }
   | { s: 'fatal'; msg: string; loc?: VSourceLocation }
+  /** $readmemh / $readmemb into an unpacked array */
+  | {
+      s: 'readmem';
+      isHex: boolean;
+      filename: string;
+      mem: VExpr;
+      start?: VExpr;
+      end?: VExpr;
+      loc?: VSourceLocation;
+    }
   | { s: 'finish'; loc?: VSourceLocation }
   | { s: 'stop'; loc?: VSourceLocation };
 
