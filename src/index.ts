@@ -6,7 +6,7 @@ import { exportProject } from './exportProject';
 import { FPSCounter } from './FPSCounter';
 import { loadProjectFromRepo } from './github/loadProject';
 import { InputController } from './InputController';
-import { HDLModuleDef } from './sim/hdltypes';
+import { VModel } from './sim/hdltypes';
 import { HDLModuleWASM } from './sim/hdlwasm';
 import {
   decodeVGAOutput,
@@ -20,7 +20,7 @@ import {
 import { initErrorOverlay } from './ui/ErrorOverlay';
 import { FileTabs } from './ui/FileTabs';
 import { initPresetBar } from './ui/PresetBar';
-import { compileVerilator, downloadRawFile } from './verilator/compile';
+import { compileVerilator, downloadRawFile, isDebugMode } from './verilator/compile';
 import { detectTopModule } from './verilog';
 
 self.MonacoEnvironment = {
@@ -97,14 +97,18 @@ function reset() {
   resetModule(jmod);
 }
 
-async function initModule(modules: Record<string, HDLModuleDef>) {
+async function initModule(model: VModel) {
   if (jmod) jmod.dispose();
-  let mod = modules['TOP'];
-  if (!mod) {
-    mod = modules['$root'];
+  jmod = null;
+  let mod: HDLModuleWASM | null = null;
+  try {
+    mod = new HDLModuleWASM(model);
+    await mod.init();
+  } catch (e) {
+    if (isDebugMode() && mod) downloadRawFile(mod.wat, 'debug.wat');
+    throw e;
   }
-  jmod = new HDLModuleWASM(mod, modules['@CONST-POOL@']);
-  await jmod.init();
+  jmod = mod!;
   jmod.getFileData = (path) => currentProject.dataFiles?.[path];
   uo_out_offset = jmod.globals.lookup('uo_out').offset;
   uio_out_offset = jmod.globals.lookup('uio_out').offset;
@@ -121,12 +125,11 @@ fileTabs.updateMarkers(res.errors);
 
 if (res.output) {
   try {
-    await initModule(res.output.modules);
+    await initModule(res.output);
     stopped = false;
   } catch (e) {
-    console.log(e, (e as Error).stack);
+    console.error(e);
     errorOverlay.show('Simulation Error', e instanceof Error ? e.message : String(e));
-    downloadRawFile(jmod?.rawwasm ?? '', 'debug.wat');
   }
 } else {
   errorOverlay.showCompileErrors(res.errors);
@@ -201,11 +204,10 @@ editor.onDidChangeModelContent(async () => {
   errorOverlay.hide();
   inputController.resetButtonStates();
   try {
-    await initModule(res.output.modules);
+    await initModule(res.output);
   } catch (e) {
-    console.log(e, (e as Error).stack);
+    console.error(e);
     errorOverlay.show('Simulation Error', e instanceof Error ? e.message : String(e));
-    downloadRawFile(jmod?.rawwasm ?? '', 'debug.wat');
     return;
   }
   fpsCounter.reset();
@@ -246,14 +248,21 @@ function animationFrame(now: number) {
 
   audioEngine.enablePerTickUpdate = audioEngine.needsFeeding;
   const data = new Uint8Array(imageData.data.buffer);
-  renderVGAFrame(jmod!, data, {
-    polarity: syncPolarity,
-    onTick: () => audioEngine.update(),
-    onLine: () => inputController.updateGamepadPmod(),
-  });
-  ctx!.putImageData(imageData, 0, 0);
-  waitFor(() => getVGASignals().vsync);
-  waitFor(() => !getVGASignals().vsync);
+  try {
+    renderVGAFrame(jmod!, data, {
+      polarity: syncPolarity,
+      onTick: () => audioEngine.update(),
+      onLine: () => inputController.updateGamepadPmod(),
+    });
+    ctx!.putImageData(imageData, 0, 0);
+    waitFor(() => getVGASignals().vsync);
+    waitFor(() => !getVGASignals().vsync);
+  } catch (e) {
+    // e.g. a combinational loop that does not converge (DIDNOTCONVERGE)
+    stopped = true;
+    console.error(e);
+    errorOverlay.show('Simulation Error', e instanceof Error ? e.message : String(e));
+  }
 }
 
 requestAnimationFrame(animationFrame);

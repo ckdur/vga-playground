@@ -1,964 +1,680 @@
-import {
-  HDLAlwaysBlock,
-  HDLArrayItem,
-  HDLBinop,
-  HDLBlock,
-  HDLConstant,
-  HDLDataType,
-  HDLDataTypeObject,
-  HDLExpr,
-  HDLExtendop,
-  HDLFile,
-  HDLFuncCall,
-  HDLHierarchyDef,
-  HDLInstanceDef,
-  HDLLogicType,
-  HDLModuleDef,
-  HDLNativeType,
-  HDLPort,
-  HDLSensItem,
-  HDLSourceLocation,
-  HDLSourceObject,
-  HDLTriop,
-  HDLUnit,
-  HDLUnop,
-  HDLUnpackArray,
-  HDLVariableDef,
-  HDLVarRef,
-  HDLWhileOp,
-  isConstExpr,
-  isVarDecl,
-} from './hdltypes';
-import { JSONNode, parseJSONPoorly } from './json';
-
 /**
- * Whaa?
+ * Converts the JSON tree dumped by Verilator 5 (`obj_dir/V<top>.tree.json`,
+ * produced by `--debug-check` or `--json-only`) into the VModel IR.
  *
- * Each hierarchy takes (uint32[] -> uint32[])
- * - convert to/from js object
- * - JS or WASM
- * - Fixed-size packets
- * - state is another uint32[]
- * Find optimal packing of bits
- * Find clocks
- * Find pivots (reset, state) concat them together
- * Dependency cycles
- * https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/SharedArrayBuffer
+ * The final tree is the one Verilator uses to emit C++, so it consists of:
+ *   - the `$root` module, with every (flattened) variable and all CFUNCs
+ *     (_eval, _eval_static, _eval_initial, _eval_settle, _ctor_var_reset...)
+ *   - the constant pool (`@CONST-POOL@`), with read-only tables
+ *   - packages and classes (only package variables/functions are supported)
+ *
+ * Every reference in the tree is by address (`varp`, `funcp`, `dtypep`...),
+ * so names never need to be resolved.
  */
+import {
+  isArray,
+  isLogic,
+  VExpr,
+  VFunc,
+  VInit,
+  VLogicType,
+  VModel,
+  VSourceLocation,
+  VStmt,
+  VType,
+  VVar,
+  VVarScope,
+} from './hdltypes';
 
-export class CompileError extends Error implements HDLSourceObject {
-  $loc: HDLSourceLocation;
-  constructor($loc: HDLSourceLocation, msg: string) {
-    super(msg);
-    this.$loc = $loc;
+type JNode = Record<string, any> & { type: string; addr?: string };
+
+export class CompileError extends Error {
+  loc?: VSourceLocation;
+  constructor(loc: VSourceLocation | undefined, msg: string) {
+    super(loc ? `${msg} (${loc.path ?? ''}:${loc.line})` : msg);
+    this.loc = loc;
     Object.setPrototypeOf(this, CompileError.prototype);
   }
 }
 
-export class VerilogJSONParser implements HDLUnit {
-  files: { [id: string]: HDLFile } = {};
-  dtypes: { [id: string]: HDLDataType } = {};
-  modules: { [id: string]: HDLModuleDef } = {};
-  hierarchies: { [id: string]: HDLHierarchyDef } = {};
+const VOID: VType = { kind: 'void', name: 'void' };
 
-  cur_node!: JSONNode;
-  cur_module!: HDLModuleDef;
-  cur_loc!: HDLSourceLocation;
-  cur_loc_str!: string;
-  cur_deferred: Array<() => void> = [];
+// Expression node types that map 1:1 to an operator (lowercase name is the op)
+const UNOPS = new Set([
+  'NOT',
+  'NEGATE',
+  'REDAND',
+  'REDOR',
+  'REDXOR',
+  'LOGNOT',
+  'CCAST',
+  'EXTEND',
+  'EXTENDS',
+  'ONEHOT',
+  'ONEHOT0',
+  'COUNTONES',
+  'CLOG2',
+  'ISUNKNOWN',
+]);
+const BINOPS = new Set([
+  'ADD',
+  'SUB',
+  'MUL',
+  'MULS',
+  'DIV',
+  'DIVS',
+  'MODDIV',
+  'MODDIVS',
+  'POW',
+  'POWSS',
+  'POWSU',
+  'POWUS',
+  'AND',
+  'OR',
+  'XOR',
+  'LOGAND',
+  'LOGOR',
+  'LOGIF',
+  'LOGEQ',
+  'EQ',
+  'NEQ',
+  'LT',
+  'LTE',
+  'GT',
+  'GTE',
+  'LTS',
+  'LTES',
+  'GTS',
+  'GTES',
+  'EQCASE',
+  'NEQCASE',
+  'EQWILD',
+  'NEQWILD',
+  'SHIFTL',
+  'SHIFTR',
+  'SHIFTRS',
+  'SHIFTLOVR',
+  'SHIFTROVR',
+  'SHIFTRSOVR',
+  'CONCAT',
+  'REPLICATE',
+]);
 
-  constructor() {
-    // TODO: other types?
-    this.dtypes['QData'] = { left: 63, right: 0, signed: false };
-    this.dtypes['IData'] = { left: 31, right: 0, signed: false };
-    this.dtypes['SData'] = { left: 15, right: 0, signed: false };
-    this.dtypes['CData'] = { left: 7, right: 0, signed: false };
-    this.dtypes['byte'] = { left: 7, right: 0, signed: true };
-    this.dtypes['shortint'] = { left: 15, right: 0, signed: true };
-    this.dtypes['int'] = { left: 31, right: 0, signed: true };
-    this.dtypes['integer'] = { left: 31, right: 0, signed: true };
-    this.dtypes['longint'] = { left: 63, right: 0, signed: true };
-    this.dtypes['time'] = { left: 63, right: 0, signed: false };
+// Some binops keep their operands in other fields
+const OPERAND_FIELDS: Record<string, [string, string]> = {
+  ARRAYSEL: ['fromp', 'bitp'],
+  WORDSEL: ['fromp', 'bitp'],
+  REPLICATE: ['srcp', 'countp'],
+};
+
+export function parseConstValue(s: string): { value: bigint; width: number | null; str?: string } {
+  // Sized literal: 32'h1, 64'shffff..., 100'h1_0000
+  const m = /^(\d+)'(s?)([hbdo])([0-9a-fA-F_xXzZ?]+)$/.exec(s);
+  if (m) {
+    const width = parseInt(m[1]);
+    const digits = m[4].replace(/_/g, '').replace(/[xXzZ?]/g, '0');
+    const radix = { h: 16, b: 2, d: 10, o: 8 }[m[3] as 'h' | 'b' | 'd' | 'o'];
+    let value = 0n;
+    for (const ch of digits.toLowerCase()) value = value * BigInt(radix) + BigInt(parseInt(ch, 16));
+    return { value, width };
+  }
+  // String literal (only meaningful for $display & co, which are ignored)
+  if (s.startsWith('"')) {
+    let str = s.slice(1, -1);
+    try {
+      str = JSON.parse(s.replace(/\\"/g, '"'));
+    } catch {}
+    return { value: 0n, width: null, str };
+  }
+  if (/^-?\d+$/.test(s)) return { value: BigInt(s), width: null };
+  if (/^-?\d*\.\d*(e[-+]?\d+)?$/i.test(s))
+    return { value: BigInt(Math.trunc(parseFloat(s))), width: null };
+  throw new Error(`could not parse constant "${s}"`);
+}
+
+/** Two's complement value truncated to 'width' bits (negative literals wrap) */
+function maskTo(value: bigint, width: number) {
+  return BigInt.asUintN(width, value);
+}
+
+export class VerilogJSONParser {
+  /** Resulting model */
+  model: VModel = { vars: [], funcs: [], warnings: [] };
+
+  private nodes = new Map<string, JNode>(); // addr -> node (dtypes, vars, funcs, jumpblocks)
+  private types = new Map<string, VType>();
+  private vars = new Map<string, VVar>();
+  private funcs = new Map<string, VFunc>();
+  private files = new Map<string, string>();
+  private usedNames = new Set<string>();
+  private curFunc: VFunc | null = null;
+
+  /** File names from V<top>.tree.meta.json ({files: {id: {filename}}}) */
+  setFileNames(meta: { files?: Record<string, { filename: string }> }) {
+    for (const [id, f] of Object.entries(meta.files ?? {})) this.files.set(id, f.filename);
   }
 
-  defer(fn: () => void) {
-    this.cur_deferred.unshift(fn);
-  }
-
-  defer2(fn: () => void) {
-    this.cur_deferred.push(fn);
-  }
-
-  run_deferred() {
-    this.cur_deferred.forEach((fn) => fn());
-    this.cur_deferred = [];
-  }
-
-  name2js(s: string) {
-    if (s == null) throw new CompileError(this.cur_loc, `no name`);
-    return s.replace(/[^a-z0-9_]/gi, '$');
-  }
-
-  findChildren(node: JSONNode, type: string, required: boolean): JSONNode[] {
-    const arr = node.children.filter((n) => n.type == type);
-    if (arr.length == 0 && required)
-      throw new CompileError(this.cur_loc, `no child of type ${type}`);
-    return arr;
-  }
-
-  parseSourceLocation(node: JSONNode): HDLSourceLocation | undefined {
-    const loc = node.attrs['loc'];
-    if (loc) {
-      if (loc == this.cur_loc_str) {
-        return this.cur_loc; // cache last parsed $loc object
-      } else {
-        const [fileid, line, col, end_line, end_col] = loc.split(/[,:]/);
-        const file = this.files[fileid] ?? fileid;
-        const filename = file.filename ?? fileid;
-        const $loc = {
-          hdlfile: file,
-          path: filename,
-          line: parseInt(line),
-          start: parseInt(col) - 1,
-          end_line: parseInt(end_line),
-          end: parseInt(end_col) - 1,
-        };
-        this.cur_loc = $loc;
-        this.cur_loc_str = loc;
-        return $loc;
+  parse(json: string | object) {
+    const root: JNode = typeof json === 'string' ? JSON.parse(json) : (json as JNode);
+    if (root.type !== 'NETLIST' || !Array.isArray(root.modulesp)) {
+      throw new CompileError(undefined, 'not a Verilator netlist JSON');
+    }
+    this.indexTree(root);
+    // Modules and constant pool
+    const modules: JNode[] = [...root.modulesp];
+    for (const m of root.miscsp ?? []) {
+      if (m.type === 'CONSTPOOL') modules.push(...(m.modulep ?? []));
+    }
+    // 1st pass: declare all global variables and functions (so references
+    // can be resolved in any order)
+    for (const mod of modules) {
+      if (!this.isSupportedModule(mod)) continue;
+      for (const stmt of mod.stmtsp ?? []) {
+        if (stmt.type === 'VAR') this.declareVar(stmt, 'global', mod.name === '@CONST-POOL@');
+        else if (stmt.type === 'CFUNC') this.declareFunc(stmt);
       }
-    } else {
-      return undefined;
+    }
+    // 2nd pass: function bodies
+    for (const mod of modules) {
+      if (!this.isSupportedModule(mod)) continue;
+      for (const stmt of mod.stmtsp ?? []) {
+        if (stmt.type === 'CFUNC') this.defineFunc(stmt);
+      }
+    }
+    this.model.vars = [...this.vars.values()].filter((v) => v.scope === 'global');
+    this.model.funcs = [...this.funcs.values()];
+    return this.model;
+  }
+
+  /** Packages and the root module are simulated, classes are ignored */
+  private isSupportedModule(mod: JNode) {
+    return mod.type === 'MODULE' || mod.type === 'PACKAGE';
+  }
+
+  private indexTree(node: JNode) {
+    const stack: JNode[] = [node];
+    while (stack.length) {
+      const n = stack.pop()!;
+      if (
+        n.addr &&
+        (n.type.endsWith('DTYPE') ||
+          n.type === 'VAR' ||
+          n.type === 'CFUNC' ||
+          n.type === 'JUMPBLOCK')
+      ) {
+        this.nodes.set(n.addr, n);
+      }
+      for (const v of Object.values(n)) {
+        if (Array.isArray(v)) for (const c of v) if (c && typeof c === 'object') stack.push(c);
+      }
     }
   }
 
-  open_module(node: JSONNode) {
-    const module: HDLModuleDef = {
-      $loc: this.parseSourceLocation(node),
-      name: node.attrs['name'],
-      origName: node.attrs['origName'],
-      blocks: [],
-      instances: [],
-      vardefs: {},
-    };
-    if (this.cur_module) throw new CompileError(this.cur_loc, `nested modules not supported`);
-    this.cur_module = module;
-    return module;
+  private loc(node: JNode): VSourceLocation | undefined {
+    const loc: string | undefined = node.loc;
+    if (!loc) return undefined;
+    const m = /^(\w+),(\d+):(\d+)/.exec(loc);
+    if (!m) return undefined;
+    return { path: this.files.get(m[1]) ?? m[1], line: parseInt(m[2]), start: parseInt(m[3]) - 1 };
   }
 
-  deferDataType(node: JSONNode, def: HDLDataTypeObject) {
-    const dtype_id = node.attrs['dtypep'];
-    if (dtype_id != null) {
-      this.defer(() => {
-        def.dtype = this.dtypes[dtype_id];
-        if (!def.dtype) {
-          throw new CompileError(this.cur_loc, `Unknown data type ${dtype_id} for ${node.type}`);
+  private fail(node: JNode, msg: string): never {
+    throw new CompileError(this.loc(node), msg);
+  }
+
+  // --- Types ---
+
+  dtype(addr: string | undefined, node?: JNode): VType {
+    if (!addr) return VOID;
+    const cached = this.types.get(addr);
+    if (cached) return cached;
+    const dn = this.nodes.get(addr);
+    if (!dn) {
+      if (node) this.fail(node, `unknown data type ${addr}`);
+      return { kind: 'unsupported', name: addr };
+    }
+    // Insert a placeholder to break cycles (self-referencing classes)
+    this.types.set(addr, { kind: 'unsupported', name: dn.type });
+    const t = this.makeType(dn);
+    this.types.set(addr, t);
+    return t;
+  }
+
+  private rangeCount(dn: JNode): { count: number; lo: number } {
+    const decl = /\[(-?\d+):(-?\d+)\]/.exec(dn.declRange ?? '');
+    if (decl) {
+      const l = parseInt(decl[1]);
+      const r = parseInt(decl[2]);
+      return { count: Math.abs(l - r) + 1, lo: Math.min(l, r) };
+    }
+    const range = dn.rangep?.[0];
+    if (range && range.leftp?.[0]?.type === 'CONST' && range.rightp?.[0]?.type === 'CONST') {
+      const l = Number(parseConstValue(range.leftp[0].name).value);
+      const r = Number(parseConstValue(range.rightp[0].name).value);
+      return { count: Math.abs(l - r) + 1, lo: Math.min(l, r) };
+    }
+    this.fail(dn, `cannot determine array range`);
+  }
+
+  private makeType(dn: JNode): VType {
+    const signed = dn.signed === true || dn.signed === 'true';
+    const withWidth = (width: number): VLogicType => ({
+      kind: 'logic',
+      width,
+      widthMin: typeof dn.widthMin === 'number' && dn.widthMin > 0 ? dn.widthMin : width,
+      signed,
+    });
+    switch (dn.type) {
+      case 'BASICDTYPE': {
+        const kw: string = dn.keyword ?? dn.name;
+        if (kw === 'string') return { kind: 'string', name: kw };
+        if (kw === 'real' || kw === 'double' || kw === 'shortreal')
+          return { kind: 'real', name: kw };
+        if (typeof dn.width === 'number' && dn.width > 0) return withWidth(dn.width);
+        const range = /^(-?\d+):(-?\d+)$/.exec(dn.range ?? '');
+        if (range) return withWidth(Math.abs(parseInt(range[1]) - parseInt(range[2])) + 1);
+        const widths: Record<string, number> = {
+          bit: 1,
+          logic: 1,
+          byte: 8,
+          shortint: 16,
+          int: 32,
+          integer: 32,
+          longint: 64,
+          time: 64,
+          CData: 8,
+          SData: 16,
+          IData: 32,
+          QData: 64,
+          EData: 32,
+        };
+        if (widths[kw]) return withWidth(widths[kw]);
+        return { kind: 'unsupported', name: kw };
+      }
+      case 'PACKARRAYDTYPE':
+      case 'STRUCTDTYPE':
+      case 'UNIONDTYPE': {
+        if (typeof dn.width === 'number' && dn.width > 0) return withWidth(dn.width);
+        if (dn.type === 'PACKARRAYDTYPE') {
+          const elem = this.dtype(dn.refDTypep, dn);
+          if (isLogic(elem)) return withWidth(elem.width * this.rangeCount(dn).count);
         }
-      });
-    }
-  }
-
-  parseConstValue(s: string): { value: number | bigint; origWidth: number } {
-    // Match constants like 32'hABCD or 512'h0000_1234_... (with optional underscores)
-    const re_const = /(\d+)'([s]?)h([0-9a-f_]+)/i;
-    const m = re_const.exec(s);
-    if (m) {
-      const origWidth = parseInt(m[1]);
-      // Remove underscores from hex string
-      const numstr = m[3].replace(/_/g, '');
-      if (numstr.length <= 8) return { value: parseInt(numstr, 16), origWidth };
-      else return { value: BigInt('0x' + numstr), origWidth };
-    } else {
-      try {
-        // Just try to treat it as a number of 32 bits
-        const num = parseInt(s);
-        const origWidth = 32;
-        return { value: num, origWidth };
-      } catch {
-        throw new CompileError(this.cur_loc, `could not parse constant "${s}"`);
+        return { kind: 'unsupported', name: dn.type };
       }
-    }
-  }
-
-  resolveVar(s: string, mod: HDLModuleDef): HDLVariableDef {
-    const def = mod.vardefs[s];
-    if (def == null) throw new CompileError(this.cur_loc, `could not resolve variable "${s}"`);
-    return def;
-  }
-
-  resolveModule(s: string): HDLModuleDef {
-    const mod = this.modules[s];
-    if (mod == null) throw new CompileError(this.cur_loc, `could not resolve module "${s}"`);
-    return mod;
-  }
-
-  //
-
-  visit_verilator_xml(node: JSONNode) {}
-
-  visit_package(node: JSONNode) {
-    // TODO?
-  }
-
-  visit_module(node: JSONNode) {
-    this.findChildren(node, 'var', false).forEach((n) => {
-      if (isVarDecl(n.obj)) {
-        this.cur_module.vardefs[n.obj.name] = n.obj;
+      case 'UNPACKARRAYDTYPE': {
+        const elem = this.dtype(dn.refDTypep ?? dn.childDTypep?.[0]?.addr, dn);
+        const { count, lo } = this.rangeCount(dn);
+        return { kind: 'array', elem, count, lo };
       }
-    });
-    this.modules[this.cur_module.name] = this.cur_module;
-    this.cur_module = null!;
-  }
-
-  visit_var(node: JSONNode): HDLVariableDef {
-    let name = node.attrs['name'];
-    name = this.name2js(name);
-    const vardef: HDLVariableDef = {
-      $loc: this.parseSourceLocation(node),
-      name: name,
-      origName: node.attrs['origName'],
-      isInput: node.attrs['dir'] == 'input',
-      isOutput: node.attrs['dir'] == 'output',
-      isParam: node.attrs['param'] == 'true',
-      dtype: null!,
-    };
-    this.deferDataType(node, vardef);
-    const const_nodes = this.findChildren(node, 'const', false);
-    if (const_nodes.length) {
-      vardef.constValue = const_nodes[0].obj;
-    }
-    const init_nodes = this.findChildren(node, 'initarray', false);
-    if (init_nodes.length) {
-      vardef.initValue = init_nodes[0].obj;
-    }
-    return vardef;
-  }
-
-  visit_const(node: JSONNode): HDLConstant {
-    const name = node.attrs['name'];
-    const { value, origWidth } = this.parseConstValue(name);
-    const constdef: HDLConstant = {
-      $loc: this.parseSourceLocation(node),
-      dtype: null!,
-      cvalue: typeof value === 'number' ? value : null!,
-      bigvalue: typeof value === 'bigint' ? value : null!,
-      origWidth,
-    };
-    this.deferDataType(node, constdef);
-    return constdef;
-  }
-
-  visit_varref(node: JSONNode): HDLVarRef {
-    let name = node.attrs['name'];
-    name = this.name2js(name);
-    const varref: HDLVarRef = {
-      $loc: this.parseSourceLocation(node),
-      dtype: null!,
-      refname: name,
-    };
-    this.deferDataType(node, varref);
-    const mod = this.cur_module;
-    /*
-        this.defer2(() => {
-            varref.vardef = this.resolveVar(name, mod);
-        });
-        */
-    return varref;
-  }
-
-  visit_sentree(node: JSONNode) {
-    // TODO
-  }
-
-  visit_always(node: JSONNode): HDLAlwaysBlock {
-    // TODO
-    let sentree: HDLSensItem[] | null;
-    let expr: HDLExpr;
-    if (node.children.length == 2) {
-      sentree = node.children[0].obj as HDLSensItem[];
-      expr = node.children[1].obj as HDLExpr;
-      // TODO: check sentree
-    } else {
-      sentree = null;
-      expr = node.children[0].obj as HDLExpr;
-    }
-    const always: HDLAlwaysBlock = {
-      $loc: this.parseSourceLocation(node),
-      blocktype: node.type,
-      name: null!,
-      senlist: sentree!,
-      exprs: [expr],
-    };
-    this.cur_module.blocks.push(always);
-    return always;
-  }
-
-  visit_begin(node: JSONNode): HDLBlock {
-    const exprs: HDLExpr[] = [];
-    node.children.forEach((n) => exprs.push(n.obj));
-    return {
-      $loc: this.parseSourceLocation(node),
-      blocktype: node.type,
-      name: node.attrs['name'],
-      exprs: exprs,
-    };
-  }
-
-  visit_initarray(node: JSONNode): HDLBlock {
-    const parseFirstIndex = (text: string): string | null => {
-      const match = text.match(/^\s*\[([^\]]+)\]/);
-      return match ? match[1] : null;
-    };
-    // obtain our first index (we only support this)
-    var indexstr = parseFirstIndex(node.attrs['initList']);
-    var index = indexstr ? parseInt(indexstr) : 0;
-    // Pre-filter out the defaultp
-    var defaultp = node.children.filter((x) => x.attrs['JSONfrom'] == 'defaultp');
-    node.children = node.children.filter((x) => x.attrs['JSONfrom'] != 'defaultp');
-
-    node.children.forEach((x: JSONNode) => {
-      x.attrs['JSONindex'] = String(parseInt(x.attrs['JSONindex']) + index);
-      x.obj.index = x.obj.index + index; // Granted that is a inititem
-    });
-    // TODO: Extend this default not only to the beginning, but also the end
-    for (let i = 0; i < index; i++) {
-      // Encapsulate the defaultp into an initarray
-      var inititem: JSONNode = {
-        type: 'inititem',
-        text: '',
-        children: [defaultp[0]],
-        attrs: { JSONindex: String(i) },
-        obj: null,
-      };
-      inititem.obj = this.visit_inititem(inititem);
-      node.children.push(inititem);
-    }
-    return this.visit_begin(node);
-  }
-
-  visit_inititem(node: JSONNode): HDLArrayItem {
-    this.expectChildren(node, 1, 1);
-    return {
-      index: parseInt(node.attrs['JSONindex']),
-      expr: node.children[0].obj,
-    };
-  }
-
-  visit_cfunc(node: JSONNode) {
-    if (this.cur_module == null) {
-      return;
-    }
-    const block = this.visit_begin(node);
-    block.exprs = [];
-    node.children.forEach((n) => {
-      if (n.attrs['JSONfrom'] == 'argsp') {
-        if (n.type != 'var') return; // Skips assigns with cresets
-        n.attrs['param'] = 'true';
-        n.obj.isParam = true;
-      }
-      block.exprs.push(n.obj);
-    });
-    this.cur_module.blocks.push(block);
-    return block;
-  }
-
-  visit_cuse(node: JSONNode) {
-    // TODO?
-  }
-
-  visit_instance(node: JSONNode): HDLInstanceDef {
-    const instance: HDLInstanceDef = {
-      $loc: this.parseSourceLocation(node),
-      name: node.attrs['name'],
-      origName: node.attrs['origName'],
-      ports: [],
-      module: null!,
-    };
-    node.children.forEach((child) => {
-      instance.ports.push(child.obj);
-    });
-    this.cur_module.instances.push(instance);
-    this.defer(() => {
-      instance.module = this.resolveModule(node.attrs['defName']);
-    });
-    return instance;
-  }
-
-  visit_iface(node: JSONNode) {
-    throw new CompileError(this.cur_loc, `interfaces not supported`);
-  }
-
-  visit_intfref(node: JSONNode) {
-    throw new CompileError(this.cur_loc, `interfaces not supported`);
-  }
-
-  visit_port(node: JSONNode): HDLPort {
-    this.expectChildren(node, 1, 1);
-    const varref: HDLPort = {
-      $loc: this.parseSourceLocation(node),
-      name: node.attrs['name'],
-      expr: node.children[0].obj,
-    };
-    return varref;
-  }
-
-  visit_netlist(node: JSONNode) {}
-
-  visit_files(node: JSONNode) {}
-
-  visit_module_files(node: JSONNode) {
-    node.children.forEach((n) => {
-      if (n.obj) {
-        const file = this.files[(n.obj as HDLFile).id];
-        if (file) file.isModule = true;
-      }
-    });
-  }
-
-  visit_file(node: JSONNode) {
-    return this.visit_file_or_module(node, false);
-  }
-
-  // TODO
-  visit_scope(node: JSONNode) {}
-
-  visit_topscope(node: JSONNode) {}
-
-  visit_file_or_module(node: JSONNode, isModule: boolean): HDLFile {
-    const file: HDLFile = {
-      id: node.attrs['id'],
-      filename: node.attrs['filename'],
-      isModule: isModule,
-    };
-    this.files[file.id] = file;
-    return file;
-  }
-
-  visit_cells(node: JSONNode) {
-    this.expectChildren(node, 1, 9999);
-    const hier = node.children[0].obj as HDLHierarchyDef;
-    if (hier != null) {
-      const hiername = hier.name;
-      this.hierarchies[hiername] = hier;
-    }
-  }
-
-  visit_cell(node: JSONNode): HDLHierarchyDef {
-    const hier: HDLHierarchyDef = {
-      $loc: this.parseSourceLocation(node),
-      name: node.attrs['name'],
-      module: null!,
-      parent: null!,
-      children: node.children.map((n) => n.obj),
-    };
-    if (node.children.length > 0)
-      throw new CompileError(this.cur_loc, `multiple non-flattened modules not yet supported`);
-    node.children.forEach((n) => ((n.obj as HDLHierarchyDef).parent = hier));
-    this.defer(() => {
-      hier.module = this.resolveModule(node.attrs['submodname']);
-    });
-    return hier;
-  }
-
-  parseRange(text: string | undefined): [number, number] {
-    if (!text) {
-      return [0, 0];
-    }
-    const [high, low] = text.split(':').map(Number);
-
-    return [high, low];
-  }
-
-  visit_basicdtype(node: JSONNode): HDLDataType {
-    let id = node.attrs['dtypep'];
-    let dtype: HDLDataType;
-    const dtypename = node.attrs['name'];
-    let b = true;
-    switch (dtypename) {
-      case 'logic':
-        b = false;
-      case 'integer': // TODO?
-      case 'bit':
-        const [msb, lsb] = this.parseRange(node.attrs['range']);
-        let dlogic: HDLLogicType = {
-          $loc: this.parseSourceLocation(node),
-          left: msb,
-          right: lsb,
-          signed: node.attrs['signed'] == 'true',
-          bit: b,
-        };
-        dtype = dlogic;
-        break;
-      case 'string':
-        let dstring: HDLNativeType = {
-          $loc: this.parseSourceLocation(node),
-          jstype: 'string',
-        };
-        dtype = dstring;
-        break;
+      case 'REFDTYPE':
+      case 'ENUMDTYPE':
+      case 'CONSTDTYPE':
+      case 'MEMBERDTYPE':
+      case 'PARAMTYPEDTYPE':
+      case 'TYPEDEF':
+        if (dn.refDTypep && dn.refDTypep !== 'UNLINKED') return this.dtype(dn.refDTypep, dn);
+        if (dn.childDTypep?.[0]) return this.dtype(dn.childDTypep[0].addr, dn);
+        return { kind: 'unsupported', name: dn.type };
+      case 'VOIDDTYPE':
+        return VOID;
       default:
-        dtype = this.dtypes[dtypename];
-        if (dtype == null) {
-          throw new CompileError(this.cur_loc, `unknown data type ${dtypename}`);
-        }
+        return { kind: 'unsupported', name: dn.type };
     }
-    this.dtypes[id] = dtype;
-    return dtype;
   }
 
-  visit_refdtype(node: JSONNode) {}
+  // --- Variables ---
 
-  visit_enumdtype(node: JSONNode) {}
-
-  visit_enumitem(node: JSONNode) {}
-
-  visit_packarraydtype(node: JSONNode): HDLDataType {
-    // TODO: packed?
-    return this.visit_unpackarraydtype(node);
+  private uniqueName(name: string) {
+    let n = name.replace(/[^a-zA-Z0-9_$]/g, '_');
+    if (!this.usedNames.has(n)) {
+      this.usedNames.add(n);
+      return n;
+    }
+    for (let i = 1; ; i++) {
+      const c = `${n}__${i}`;
+      if (!this.usedNames.has(c)) {
+        this.usedNames.add(c);
+        return c;
+      }
+    }
   }
 
-  visit_memberdtype(node: JSONNode) {
-    throw new CompileError(null!, `structs not supported`);
+  private declareVar(node: JNode, scope: VVarScope, isConstPool = false): VVar {
+    const existing = this.vars.get(node.addr!);
+    if (existing) return existing;
+    const type = this.dtype(node.dtypep, node);
+    const dirmap: Record<string, VVar['dir']> = {
+      INPUT: 'input',
+      OUTPUT: 'output',
+      INOUT: 'inout',
+      REF: 'inout',
+      CONSTREF: 'input',
+    };
+    const direction: string = node.direction ?? 'NONE';
+    const byRef =
+      scope === 'arg' &&
+      (direction === 'OUTPUT' ||
+        direction === 'INOUT' ||
+        direction === 'REF' ||
+        direction === 'CONSTREF' ||
+        isArray(type) ||
+        (isLogic(type) && type.width > 64));
+    const name = scope === 'global' ? this.uniqueName(node.name) : node.name;
+    const v: VVar = {
+      id: node.addr!,
+      name,
+      origName: node.origName ?? node.name,
+      type,
+      scope,
+      byRef,
+      dir: dirmap[direction] ?? 'none',
+      isPrimaryIO: node.isPrimaryIO === true,
+      isConst: isConstPool || node.isConst === true,
+      loc: this.loc(node),
+    };
+    const valuep = node.valuep?.[0];
+    if (valuep && (isConstPool || node.isConst === true || node.isParam === true)) {
+      v.init = this.initValue(valuep, type);
+    }
+    this.vars.set(node.addr!, v);
+    return v;
   }
 
-  visit_constdtype(node: JSONNode) {
-    // TODO? throw new CompileError(null, `constant data types not supported`);
-  }
-
-  visit_paramtypedtype(node: JSONNode) {
-    // TODO? throw new CompileError(null, `constant data types not supported`);
-  }
-
-  visit_unpackarraydtype(node: JSONNode): HDLDataType {
-    let id = node.attrs['dtypep'];
-    let sub_dtype_id = node.attrs['refDTypep'];
-    let range = node.children[0].obj as HDLBinop;
-    if (isConstExpr(range.left) && isConstExpr(range.right)) {
-      const dtype: HDLUnpackArray = {
-        $loc: this.parseSourceLocation(node),
-        subtype: null!,
-        low: range.left,
-        high: range.right,
-      };
-      this.dtypes[id] = dtype;
-      this.defer(() => {
-        dtype.subtype = this.dtypes[sub_dtype_id];
-        if (!dtype.subtype)
-          throw new CompileError(this.cur_loc, `Unknown data type ${sub_dtype_id} for array`);
+  private initValue(node: JNode, t: VType): VInit {
+    if (node.type === 'CONST') {
+      return { kind: 'const', value: parseConstValue(node.name).value };
+    }
+    if (node.type === 'INITARRAY') {
+      const elemType = isArray(t) ? t.elem : t;
+      const items = new Map<number, VInit>();
+      const inits: JNode[] = node.initsp ?? [];
+      // initList: " [1]=(FCC) [2]=(GCC) ..." maps indices to INITITEM addresses
+      const indexOf = new Map<string, number>();
+      const re = /\[(\d+)\]=(\([^)]*\)|0x[0-9a-f]+)/g;
+      let m: RegExpExecArray | null;
+      let truncated = /\.\.\./.test(node.initList ?? '');
+      while ((m = re.exec(node.initList ?? ''))) indexOf.set(m[2], parseInt(m[1]));
+      if (truncated) {
+        this.model.warnings.push(
+          `constant table at line ${this.loc(node)?.line} has a truncated index list; ` +
+            `rebuild verilator_bin.wasm with the vga-playground JSON patch`,
+        );
+      }
+      let next = 0;
+      inits.forEach((item) => {
+        let index = indexOf.get(item.addr!);
+        if (index === undefined) index = next; // fallback for truncated lists
+        next = index + 1;
+        items.set(index, this.initValue(item.valuep[0], elemType));
       });
-      return dtype;
-    } else {
-      throw new CompileError(this.cur_loc, `could not parse constant exprs in array`);
+      const dflt = node.defaultp?.[0] ? this.initValue(node.defaultp[0], elemType) : undefined;
+      return { kind: 'array', items, dflt };
+    }
+    this.fail(node, `unsupported initializer ${node.type}`);
+  }
+
+  // --- Functions ---
+
+  private declareFunc(node: JNode) {
+    const f: VFunc = {
+      id: node.addr!,
+      name: this.uniqueName(node.name),
+      args: [],
+      locals: [],
+      body: [],
+      ret: null,
+      loc: this.loc(node),
+    };
+    for (const a of node.argsp ?? []) {
+      if (a.type === 'VAR') f.args.push(this.declareVar(a, 'arg'));
+    }
+    for (const l of node.varsp ?? []) {
+      if (l.type === 'VAR') f.locals.push(this.declareVar(l, 'local'));
+    }
+    this.funcs.set(node.addr!, f);
+  }
+
+  private defineFunc(node: JNode) {
+    const f = this.funcs.get(node.addr!)!;
+    this.curFunc = f;
+    // locals declared among the statements
+    f.body = this.stmts(node.stmtsp ?? []);
+    // statements that initialize args (CRESET of reference args) are skipped
+    this.curFunc = null;
+    // return type: from the first value-returning CRETURN
+    const findRet = (stmts: VStmt[]): VType | null => {
+      for (const s of stmts) {
+        if (s.s === 'return' && s.value) return s.value.t;
+        let r: VType | null = null;
+        if (s.s === 'if') r = findRet(s.then) ?? findRet(s.else);
+        else if (s.s === 'loop' || s.s === 'jumpblock') r = findRet(s.body);
+        if (r) return r;
+      }
+      return null;
+    };
+    f.ret = findRet(f.body);
+    if (f.ret && isLogic(f.ret) && f.ret.width > 64) {
+      this.fail(node, `functions returning values wider than 64 bits are not supported`);
     }
   }
 
-  visit_senitem(node: JSONNode): HDLSensItem {
-    const edgeType = node.attrs['edgeType'];
-    if (edgeType != 'POS' && edgeType != 'NEG')
-      throw new CompileError(this.cur_loc, 'POS/NEG required');
-    return {
-      $loc: this.parseSourceLocation(node),
-      edgeType: edgeType,
-      expr: node.obj,
-    };
+  // --- Statements ---
+
+  private stmts(nodes: JNode[]): VStmt[] {
+    const out: VStmt[] = [];
+    for (const n of nodes) this.stmt(n, out);
+    return out;
   }
 
-  visit_text(node: JSONNode) {}
-
-  visit_cstmt(node: JSONNode) {} // For debugs, so disabled
-
-  visit_cfile(node: JSONNode) {}
-
-  visit_typetable(node: JSONNode) {}
-
-  visit_constpool(node: JSONNode) {}
-
-  visit_comment(node: JSONNode) {}
-
-  expectChildren(node: JSONNode, low: number, high: number) {
-    if (node.children.length < low || node.children.length > high)
-      throw new CompileError(this.cur_loc, `expected between ${low} and ${high} children`);
+  private stmt(n: JNode, out: VStmt[]) {
+    const loc = this.loc(n);
+    switch (n.type) {
+      case 'ASSIGN':
+      case 'ASSIGNW':
+      case 'ASSIGNDLY':
+      case 'ASSIGNPRE':
+      case 'ASSIGNPOST':
+      case 'ASSIGNFORCE': {
+        const rhsn = n.rhsp[0];
+        const lhs = this.expr(n.lhsp[0]);
+        if (rhsn.type === 'CRESET') {
+          out.push({ s: 'creset', lhs, loc });
+        } else {
+          out.push({ s: 'assign', lhs, rhs: this.expr(rhsn), loc });
+        }
+        return;
+      }
+      case 'IF':
+        out.push({
+          s: 'if',
+          cond: this.expr(n.condp[0]),
+          then: this.stmts(n.thensp ?? []),
+          else: this.stmts(n.elsesp ?? []),
+          loc,
+        });
+        return;
+      case 'LOOP':
+        out.push({ s: 'loop', body: this.stmts([...(n.stmtsp ?? []), ...(n.contsp ?? [])]), loc });
+        return;
+      case 'LOOPTEST':
+        out.push({ s: 'looptest', cond: this.expr(n.condp[0]), loc });
+        return;
+      case 'WHILE': {
+        // Older Verilator: WHILE(precondsp, condp, stmtsp, incsp)
+        const body: VStmt[] = [
+          ...this.stmts(n.precondsp ?? []),
+          { s: 'looptest', cond: this.expr(n.condp[0]), loc },
+          ...this.stmts(n.stmtsp ?? []),
+          ...this.stmts(n.incsp ?? []),
+        ];
+        out.push({ s: 'loop', body, loc });
+        return;
+      }
+      case 'JUMPBLOCK':
+        out.push({ s: 'jumpblock', id: n.addr!, body: this.stmts(n.stmtsp ?? []), loc });
+        return;
+      case 'JUMPGO':
+        out.push({ s: 'jumpgo', id: n.blockp, loc });
+        return;
+      case 'JUMPLABEL':
+        return;
+      case 'CRETURN':
+        out.push({ s: 'return', value: n.lhsp?.[0] ? this.expr(n.lhsp[0]) : undefined, loc });
+        return;
+      case 'STMTEXPR': {
+        const e = n.exprp[0];
+        if (this.ignorableExpr(e)) return;
+        out.push({ s: 'expr', e: this.expr(e), loc });
+        return;
+      }
+      case 'CSTMT':
+      case 'CSTMTUSER': {
+        // Raw C code. Only fatal errors matter for simulation, the rest is
+        // debugging output (VL_DEBUG blocks), statistics or class plumbing.
+        const text = (n.nodesp ?? [])
+          .filter((t: JNode) => t.type === 'TEXT')
+          .map((t: JNode) => t.text)
+          .join('');
+        const fatal = /VL_FATAL_MT\([^,]*,\s*\d+,\s*"[^"]*",\s*"((?:[^"\\]|\\.)*)"/.exec(text);
+        if (fatal) out.push({ s: 'fatal', msg: fatal[1], loc });
+        else if (/VL_FINISH_MT|gotFinish\(true\)/.test(text)) out.push({ s: 'finish', loc });
+        else if (/VL_STOP_MT/.test(text)) out.push({ s: 'stop', loc });
+        return;
+      }
+      case 'FINISH':
+        out.push({ s: 'finish', loc });
+        return;
+      case 'STOP':
+        out.push({ s: 'stop', loc });
+        return;
+      case 'VAR':
+        if (this.curFunc) this.curFunc.locals.push(this.declareVar(n, 'local'));
+        return;
+      case 'COMMENT':
+      case 'DISPLAY':
+      case 'FCLOSE':
+      case 'FFLUSH':
+      case 'PRINTTIMESCALE':
+      case 'CUSE':
+      case 'TEXT':
+      case 'TRACEDECL':
+      case 'TRACEINC':
+      case 'COVERDECL':
+      case 'COVERINC':
+        return;
+      case 'BEGIN':
+        for (const s of n.stmtsp ?? []) this.stmt(s, out);
+        return;
+      default:
+        this.fail(n, `unsupported statement ${n.type}`);
+    }
   }
 
-  __visit_unop(node: JSONNode): HDLUnop {
-    this.expectChildren(node, 1, 1);
-    const expr: HDLUnop = {
-      $loc: this.parseSourceLocation(node),
-      op: node.type,
-      dtype: null!,
-      left: node.children[0].obj as HDLExpr,
-    };
-    this.deferDataType(node, expr);
-    return expr;
+  /** Calls/expressions that only exist for debugging or classes */
+  private ignorableExpr(e: JNode) {
+    if (e.type === 'CCALL') {
+      const fn = this.nodes.get(e.funcp);
+      // calls to debug dumps (only present under VL_DEBUG)
+      if (fn && /^_dump_triggers__/.test(fn.name)) return true;
+      if (!fn || !this.funcs.has(e.funcp)) {
+        this.fail(e, `call to unsupported function ${e.funcName}`);
+      }
+    }
+    return e.type === 'CMETHODHARD' && /^(randstate|reseed)/.test(e.name ?? '');
   }
 
-  visit_extend(node: JSONNode): HDLUnop {
-    const unop = this.__visit_unop(node) as HDLExtendop;
-    unop.width = parseInt(node.attrs['width']);
-    unop.widthminv = parseInt(node.attrs['widthminv']);
-    return unop;
-  }
+  // --- Expressions ---
 
-  visit_extends(node: JSONNode): HDLUnop {
-    return this.visit_extend(node);
-  }
-
-  __visit_binop(node: JSONNode): HDLBinop {
-    this.expectChildren(node, 2, 2);
-    const expr: HDLBinop = {
-      $loc: this.parseSourceLocation(node),
-      op: node.type,
-      dtype: null!,
-      left: node.children[0].obj as HDLExpr,
-      right: node.children[1].obj as HDLExpr,
-    };
-    this.deferDataType(node, expr);
-    return expr;
-  }
-
-  visit_if(node: JSONNode): HDLTriop {
-    this.expectChildren(node, 2, 3);
-    const expr: HDLTriop = {
-      $loc: this.parseSourceLocation(node),
-      op: 'if',
-      dtype: null!,
-      cond: node.children[0].obj as HDLExpr,
-      left: node.children[1].obj as HDLExpr,
-      right: node.children[2] && (node.children[2].obj as HDLExpr),
-    };
-    return expr;
-  }
-
-  // while and for loops
-  visit_while(node: JSONNode): HDLWhileOp {
-    //this.expectChildren(node, 2, 4);
-    // The structure of whiles now is different
-    // everything that is not a "LOOPTEST belongs to the body"
-    // We need to create a mock node for the body only
-    var node_body: JSONNode = {
-      type: 'begin',
-      text: null,
-      children: node.children.filter((x) => x.type != 'looptest'),
-      attrs: {},
-      obj: null,
-    };
-    const expr: HDLWhileOp = {
-      $loc: this.parseSourceLocation(node),
-      op: 'while',
-      dtype: null!,
-      precond: node.children[0].type === 'looptest' ? (node.children[0].obj as HDLExpr) : null!,
-      loopcond:
-        node.children[node.children.length - 1].type === 'looptest'
-          ? (node.children[node.children.length - 1].obj as HDLExpr)
-          : null!,
-      body: this.visit_begin(node_body),
-      inc: null!, // No more increments
-    };
-    return expr;
-  }
-
-  visit_loop(node: JSONNode): HDLWhileOp {
-    return this.visit_while(node);
-  }
-
-  visit_looptest(node: JSONNode) {
-    return this.visit_begin(node); // Is just another begin
-  }
-
-  __visit_triop(node: JSONNode): HDLBinop {
-    this.expectChildren(node, 3, 3);
-    const expr: HDLTriop = {
-      $loc: this.parseSourceLocation(node),
-      op: node.type,
-      dtype: null!,
-      cond: node.children[0].obj as HDLExpr,
-      left: node.children[1].obj as HDLExpr,
-      right: node.children[2].obj as HDLExpr,
-    };
-    this.deferDataType(node, expr);
-    return expr;
-  }
-
-  __visit_func(node: JSONNode): HDLFuncCall {
-    const expr: HDLFuncCall = {
-      $loc: this.parseSourceLocation(node),
-      dtype: null!,
-      funcname: node.attrs['funcName'] || '$' + node.type,
-      args: node.children.map((n) => n.obj as HDLExpr),
-    };
-    this.deferDataType(node, expr);
-    return expr;
-  }
-
-  visit_not(node: JSONNode) {
-    return this.__visit_unop(node);
-  }
-  visit_negate(node: JSONNode) {
-    return this.__visit_unop(node);
-  }
-  visit_redand(node: JSONNode) {
-    return this.__visit_unop(node);
-  }
-  visit_redor(node: JSONNode) {
-    return this.__visit_unop(node);
-  }
-  visit_redxor(node: JSONNode) {
-    return this.__visit_unop(node);
-  }
-  visit_initial(node: JSONNode) {
-    return this.__visit_unop(node);
-  }
-  visit_ccast(node: JSONNode) {
-    return this.__visit_unop(node);
-  }
-  visit_creset(node: JSONNode) {
-    if (node.children.length == 0) {
-      // Treat it as a zero constant
-      var elemp_node: JSONNode = {
-        type: 'const',
-        text: null,
-        children: [],
-        attrs: { ...node.attrs },
-        obj: null,
+  expr(n: JNode): VExpr {
+    const loc = this.loc(n);
+    const t = this.dtype(n.dtypep, n);
+    switch (n.type) {
+      case 'CONST': {
+        const { value, width, str } = parseConstValue(n.name);
+        const w = isLogic(t) ? t.width : width ?? 64;
+        return {
+          k: 'const',
+          t,
+          value: str !== undefined ? 0n : maskTo(value, w),
+          str,
+          loc,
+        };
+      }
+      case 'VARREF': {
+        const v = this.vars.get(n.varp);
+        if (!v) this.fail(n, `reference to unknown variable ${n.name}`);
+        return { k: 'var', t: v.type, v, loc };
+      }
+      case 'CCALL': {
+        const func = this.funcs.get(n.funcp);
+        if (!func) this.fail(n, `call to unsupported function ${n.funcName}`);
+        return { k: 'call', t, func, args: (n.argsp ?? []).map((a: JNode) => this.expr(a)), loc };
+      }
+      case 'COND':
+      case 'CONDBOUND':
+        return {
+          k: 'op',
+          op: 'cond',
+          t,
+          args: [this.expr(n.condp[0]), this.expr(n.thenp[0]), this.expr(n.elsep[0])],
+          loc,
+        };
+      case 'SEL':
+        // fromp[lsbp +: width] (widthp is a constant)
+        return {
+          k: 'op',
+          op: 'sel',
+          t,
+          args: [this.expr(n.fromp[0]), this.expr(n.lsbp[0])],
+          loc,
+        };
+      case 'TIME':
+      case 'TIMED':
+        return { k: 'sys', name: '$time', t, args: [], loc };
+      case 'RAND':
+      case 'URANDOM':
+      case 'RANDRNG':
+      case 'URANDOMRANGE':
+        return {
+          k: 'sys',
+          name: '$random',
+          t,
+          args: [...(n.seedp ?? []), ...(n.lhsp ?? []), ...(n.rhsp ?? [])].map((a: JNode) =>
+            this.expr(a),
+          ),
+          loc,
+        };
+      case 'CRESET':
+        return { k: 'const', t, value: 0n, loc };
+      default:
+        break;
+    }
+    if (UNOPS.has(n.type)) {
+      return { k: 'op', op: n.type.toLowerCase(), t, args: [this.expr(n.lhsp[0])], loc };
+    }
+    const fields = OPERAND_FIELDS[n.type];
+    if (fields) {
+      return {
+        k: 'op',
+        op: n.type.toLowerCase(),
+        t,
+        args: fields.map((f) => this.expr(n[f][0])),
+        loc,
       };
-      elemp_node.attrs['name'] = '0';
-      return this.visit_const(elemp_node);
     }
-    return this.__visit_unop(node);
-  }
-  visit_creturn(node: JSONNode) {
-    return this.__visit_unop(node);
-  }
-
-  visit_assignw(node: JSONNode) {
-    return this.__visit_binop(node);
-  }
-  visit_assigndly(node: JSONNode) {
-    return this.__visit_binop(node);
-  }
-  visit_assignpre(node: JSONNode) {
-    return this.__visit_binop(node);
-  }
-  visit_assignpost(node: JSONNode) {
-    return this.__visit_binop(node);
-  }
-  visit_assign(node: JSONNode) {
-    return this.__visit_binop(node);
-  }
-  visit_arraysel(node: JSONNode) {
-    return this.__visit_binop(node);
-  }
-  visit_wordsel(node: JSONNode) {
-    return this.__visit_binop(node);
-  }
-
-  visit_eq(node: JSONNode) {
-    return this.__visit_binop(node);
-  }
-  visit_neq(node: JSONNode) {
-    return this.__visit_binop(node);
-  }
-  visit_lte(node: JSONNode) {
-    return this.__visit_binop(node);
-  }
-  visit_gte(node: JSONNode) {
-    return this.__visit_binop(node);
-  }
-  visit_lt(node: JSONNode) {
-    return this.__visit_binop(node);
-  }
-  visit_gt(node: JSONNode) {
-    return this.__visit_binop(node);
-  }
-  visit_and(node: JSONNode) {
-    return this.__visit_binop(node);
-  }
-  visit_or(node: JSONNode) {
-    return this.__visit_binop(node);
-  }
-  visit_xor(node: JSONNode) {
-    return this.__visit_binop(node);
-  }
-  visit_add(node: JSONNode) {
-    return this.__visit_binop(node);
-  }
-  visit_sub(node: JSONNode) {
-    return this.__visit_binop(node);
-  }
-  visit_concat(node: JSONNode) {
-    return this.__visit_binop(node);
-  } // TODO?
-  visit_shiftl(node: JSONNode) {
-    return this.__visit_binop(node);
-  }
-  visit_shiftlovr(node: JSONNode) {
-    return this.__visit_binop(node);
-  }
-  visit_shiftr(node: JSONNode) {
-    return this.__visit_binop(node);
-  }
-  visit_shiftrs(node: JSONNode) {
-    return this.__visit_binop(node);
-  }
-  visit_shiftrovr(node: JSONNode) {
-    return this.__visit_binop(node);
-  }
-
-  visit_mul(node: JSONNode) {
-    return this.__visit_binop(node);
-  }
-  visit_div(node: JSONNode) {
-    return this.__visit_binop(node);
-  }
-  visit_moddiv(node: JSONNode) {
-    return this.__visit_binop(node);
-  }
-  visit_muls(node: JSONNode) {
-    return this.__visit_binop(node);
-  }
-  visit_divs(node: JSONNode) {
-    return this.__visit_binop(node);
-  }
-  visit_moddivs(node: JSONNode) {
-    return this.__visit_binop(node);
-  }
-  visit_gts(node: JSONNode) {
-    return this.__visit_binop(node);
-  }
-  visit_lts(node: JSONNode) {
-    return this.__visit_binop(node);
-  }
-  visit_gtes(node: JSONNode) {
-    return this.__visit_binop(node);
-  }
-  visit_ltes(node: JSONNode) {
-    return this.__visit_binop(node);
-  }
-  // TODO: more?
-
-  visit_range(node: JSONNode) {
-    return this.__visit_binop(node);
-  }
-
-  visit_cond(node: JSONNode) {
-    return this.__visit_triop(node);
-  }
-  visit_condbound(node: JSONNode) {
-    return this.__visit_triop(node);
-  }
-  visit_sel(node: JSONNode) {
-    return this.__visit_triop(node);
-  }
-
-  visit_changedet(node: JSONNode) {
-    if (node.children.length == 0) return null;
-    else return this.__visit_binop(node);
-  }
-
-  visit_ccall(node: JSONNode) {
-    return this.__visit_func(node);
-  }
-  visit_finish(node: JSONNode) {
-    return this.__visit_func(node);
-  }
-  visit_stop(node: JSONNode) {
-    return this.__visit_func(node);
-  }
-  visit_rand(node: JSONNode) {
-    return this.__visit_func(node);
-  }
-  visit_time(node: JSONNode) {
-    return this.__visit_func(node);
-  }
-
-  visit_display(node: JSONNode) {
-    return null;
-  }
-  visit_sformatf(node: JSONNode) {
-    return null;
-  }
-  visit_scopename(node: JSONNode) {
-    return null;
-  }
-
-  visit_readmem(node: JSONNode) {
-    return this.__visit_func(node);
-  }
-
-  // Expressions for verilator 5 (TODO)
-
-  visit_stmtexpr(node: JSONNode) {
-    return this.__visit_unop(node); // A single operation
-  }
-
-  visit_textblock(node: JSONNode) {
-    // TODO
-    return null;
-  }
-
-  visit_classrefdtype(node: JSONNode) {
-    // TODO
-    return null;
-  }
-
-  visit_cmethodhard(node: JSONNode) {
-    const name = node.attrs['name'];
-    node.type = name; // To propagate to Xop
-    // Depends on the name, is the operation
-    if (node.children.length == 1) {
-      return this.__visit_unop(node); // One op
-    } else if (node.children.length == 2) {
-      return this.__visit_binop(node); // Two ops
-    } else if (node.children.length == 3) {
-      return this.__visit_triop(node); // Three ops
-    } else {
-      return; // TODO: No fail?
+    if (BINOPS.has(n.type)) {
+      return {
+        k: 'op',
+        op: n.type.toLowerCase(),
+        t,
+        args: [this.expr(n.lhsp[0]), this.expr(n.rhsp[0])],
+        loc,
+      };
     }
+    this.fail(n, `unsupported expression ${n.type}`);
   }
+}
 
-  visit_logand(node: JSONNode) {
-    return this.__visit_binop(node);
-  }
-
-  visit_voiddtype(node: JSONNode) {
-    let id = node.attrs['dtypep'];
-    let dtype: HDLDataType;
-
-    // Is actually useless
-    let dstring: HDLNativeType = {
-      $loc: this.parseSourceLocation(node),
-      jstype: 'undefined',
-    };
-    dtype = dstring;
-
-    this.dtypes[id] = dtype;
-    return dtype;
-  }
-
-  //
-
-  xml_open(node: JSONNode) {
-    this.cur_node = node;
-    const method = (this as any)[`open_${node.type}`];
-    if (method) {
-      return method.bind(this)(node);
-    }
-  }
-
-  xml_close(node: JSONNode) {
-    this.cur_node = node;
-    const method = (this as any)[`visit_${node.type}`];
-    if (method) {
-      return method.bind(this)(node);
-    } else {
-      throw new CompileError(this.cur_loc, `no visitor for ${node.type}`);
-    }
-  }
-
-  parse(jsons: string) {
-    parseJSONPoorly(jsons, this.xml_open.bind(this), this.xml_close.bind(this));
-
-    this.cur_node = null!;
-    this.run_deferred();
-  }
+export function parseVerilatorJSON(json: string | object): VModel {
+  return new VerilogJSONParser().parse(json);
 }

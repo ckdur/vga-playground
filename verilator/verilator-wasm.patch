@@ -1,0 +1,98 @@
+diff --git a/configure.ac b/configure.ac
+index 2cc95c267..6b5690727 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -670,8 +670,9 @@ AC_DEFUN([_MY_CXX_CHECK_CXX_VER],
+      ]])],
+      [_my_result=yes],
+      [_my_result=no],
+-     [_my_result=no])
++     [_my_result=yes])
+    ])
++# NOTE: In cross-compile, we assume yes.
+ 
+ # Add $CFG_CXXFLAGS_STD only if can't compile correctly otherwise,
+ # as adding std= when not needed can cause errors with the C++ std library.
+diff --git a/include/verilated_threads.cpp b/include/verilated_threads.cpp
+index c35c85512..43c5136fd 100644
+--- a/include/verilated_threads.cpp
++++ b/include/verilated_threads.cpp
+@@ -268,9 +268,11 @@ std::string VlThreadPool::numaAssign(VerilatedContext* contextp) {
+         }
+         status += ";";
+ 
++        #ifndef __EMSCRIPTEN__ // We do not need affinity in emscripten
+         const int rc = pthread_setaffinity_np(m_workers[thread]->m_cthread.native_handle(),
+                                               sizeof(cpu_set_t), &cpuset);
+         if (rc != 0) return "%Warning: pthread_setaffinity_np failed";
++        #endif
+     }
+     // std::cout << "Status: " << status << std::endl;
+     return status;
+diff --git a/include/verilatedos.h b/include/verilatedos.h
+index b93909309..fe50758f0 100644
+--- a/include/verilatedos.h
++++ b/include/verilatedos.h
+@@ -610,7 +610,8 @@ static inline double VL_ROUND(double n) {
+ #elif defined(VL_IGNORE_UNKNOWN_ARCH)
+ # define VL_CPU_RELAX()
+ #else
+-# error "Missing VL_CPU_RELAX() definition."
++# define VL_CPU_RELAX()
++# warning "Missing VL_CPU_RELAX() definition."
+ #endif
+ 
+ //=========================================================================
+diff --git a/src/V3AstNodes.cpp b/src/V3AstNodes.cpp
+index f3cede99c..df1bf0b95 100644
+--- a/src/V3AstNodes.cpp
++++ b/src/V3AstNodes.cpp
+@@ -2260,8 +2260,14 @@ void AstInitArray::dump(std::ostream& str) const {
+     dumpInitList(str);
+ }
+ void AstInitArray::dumpJson(std::ostream& str) const {
++    // Emit the complete index map (not truncated like the text dump), so that
++    // JSON consumers (e.g. vga-playground) can place sparse INITITEMs correctly.
+     str << ',' << '"' << "initList" << '"' << ':' << '"';
+-    dumpInitList(str);
++    for (const auto& itr : map()) {
++        const string addr
++            = (v3Global.opt.jsonIds() ? v3Global.ptrToId(itr.second) : nodeAddr(itr.second));
++        str << " [" << itr.first << "]=" << addr;
++    }
+     str << '"';
+     dumpJsonGen(str);
+ }
+@@ -2661,6 +2667,12 @@ void AstNodeDType::dump(std::ostream& str) const {
+ void AstNodeDType::dumpJson(std::ostream& str) const {
+     dumpJsonBoolFuncIf(str, generic);
+     if (isSigned() && !isDouble()) dumpJsonBoolIf(str, "signed", true);
++    // Widths, needed by JSON consumers to mirror the emitted C++ (e.g. the
++    // 'lbits' argument of signed VL_* helpers is the operand's widthMin)
++    if (!isDouble() && !isString()) {
++        dumpJsonNum(str, "width", width());
++        dumpJsonNum(str, "widthMin", widthMin());
++    }
+     dumpJsonGen(str);
+ }
+ void AstNodeDType::dumpSmall(std::ostream& str) const VL_MT_STABLE {
+diff --git a/src/Verilator.cpp b/src/Verilator.cpp
+index f67e830b2..82bc8743d 100644
+--- a/src/Verilator.cpp
++++ b/src/Verilator.cpp
+@@ -869,7 +869,9 @@ static void execHierVerilation() {
+ }
+ 
+ //######################################################################
+-
++#include <emscripten.h>
++extern "C" {
++EMSCRIPTEN_KEEPALIVE
+ int main(int argc, char** argv) {
+     // General initialization
+     std::ios::sync_with_stdio();
+@@ -926,3 +928,4 @@ int main(int argc, char** argv) {
+ 
+     UINFO(1, "Done, Exiting...");
+ }
++}

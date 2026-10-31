@@ -1,3 +1,4 @@
+import { VModel } from '../sim/hdltypes';
 import { VerilogJSONParser } from '../sim/vjsonparser';
 import { ErrorParser } from './ErrorParser';
 import verilated_std_sv from './verilated_std.sv?raw';
@@ -6,36 +7,54 @@ import verilator_bin from './verilator_bin';
 
 let browserWasmBin: ArrayBuffer | null = null;
 
+/** Debug helper: offer a text file for download (browser only) */
 export function downloadRawFile(
   content: string,
   fileName: string,
   contentType: string = 'text/plain',
 ) {
-  // 1. Create a Blob from the raw string
+  if (typeof document === 'undefined') return;
   const blob = new Blob([content], { type: contentType });
-
-  // 2. Create a temporary URL pointing to that Blob
   const url = window.URL.createObjectURL(blob);
-
-  // 3. Create a hidden 'a' element
   const link = document.createElement('a');
   link.href = url;
   link.download = fileName;
-
-  // 4. Append to body, click it, and remove it
   document.body.appendChild(link);
   link.click();
-
-  // Clean up
   document.body.removeChild(link);
   window.URL.revokeObjectURL(url);
+}
+
+/** True when the page was opened with ?debug (enables artifact downloads) */
+export function isDebugMode() {
+  return typeof location !== 'undefined' && new URLSearchParams(location.search).has('debug');
 }
 
 export interface ICompileOptions {
   topModule: string;
   sources: Record<string, string>;
   wasmBinary?: ArrayBuffer | Buffer;
+  /** extra verilator arguments (e.g. -DFOO) */
+  extraArgs?: string[];
 }
+
+export const VERILATOR_ARGS = [
+  '--cc',
+  '-O3',
+  '-Wall',
+  '-Wno-fatal', // lint warnings are reported as markers, but don't stop the simulation
+  '-Wno-EOFNEWLINE',
+  '-Wno-DECLFILENAME',
+  '-Wno-UNOPTFLAT',
+  '-Wno-BLKSEQ',
+  '-Wno-UNDRIVEN',
+  '-Wno-PINMISSING',
+  '-Wno-UNUSED',
+  '-Wno-WIDTHTRUNC',
+  '--x-assign',
+  'fast',
+  '--debug-check', // dumps the final tree as JSON (obj_dir/V<top>.tree.json)
+];
 
 export async function compileVerilator(opts: ICompileOptions) {
   let wasmBinary = opts.wasmBinary;
@@ -49,21 +68,20 @@ export async function compileVerilator(opts: ICompileOptions) {
 
   const errorParser = new ErrorParser();
 
-  const verilatorInst = verilator_bin({
+  // Emscripten >= 3.1.5x: the factory returns a promise of the module
+  const verilatorInst = await verilator_bin({
     wasmBinary,
     noInitialRun: true,
     noExitRuntime: true,
-    print: console.log,
+    print: () => {},
     printErr: (message: string) => {
-      console.log(message);
       errorParser.feedLine(message);
     },
   });
-  await verilatorInst.ready;
+  if (verilatorInst.ready) await verilatorInst.ready; // older emscripten
   const { FS } = verilatorInst;
 
-  let sourceList: string[] = [];
-  let cwd = FS.cwd();
+  const sourceList: string[] = [];
   FS.mkdir('src');
   FS.mkdir('/share');
   FS.mkdir('/share/verilator');
@@ -78,74 +96,60 @@ export async function compileVerilator(opts: ICompileOptions) {
       sourceList.push(path);
     }
   }
-  var contents = FS.readdir('/');
-  console.log(contents);
   const jsonPath = `obj_dir/V${opts.topModule}.tree.json`;
+  const metaPath = `obj_dir/V${opts.topModule}.tree.meta.json`;
   try {
-    const args = [
-      '--cc',
-      '-O3',
-      '-Wall',
-      '-Wno-EOFNEWLINE',
-      '-Wno-DECLFILENAME',
-      // Why do you even care?
-      '-Wno-UNOPTFLAT',
-      '-Wno-BLKSEQ',
-      '-Wno-UNDRIVEN',
-      '-Wno-PINMISSING',
-      '-Wno-UNUSED',
-      '-Wno-WIDTHTRUNC',
-      '--x-assign',
-      'fast',
-      '--debug-check', // for XML output
+    verilatorInst.callMain([
+      ...VERILATOR_ARGS,
+      ...(opts.extraArgs ?? []),
       '-Isrc/',
       '--top-module',
       opts.topModule,
       ...sourceList,
-    ];
-    verilatorInst.callMain(args);
+    ]);
   } catch (e) {
-    console.log(e);
-    errorParser.errors.push({
-      type: 'error',
-      file: '',
-      line: 1,
-      column: 1,
-      message: 'Compilation failed: ' + e,
-    });
+    // Verilator exits through exit(), which emscripten reports as an exception
+    const status = (e as { status?: number }).status;
+    if (status !== 0) {
+      errorParser.errors.push({
+        type: 'error',
+        file: '',
+        line: 1,
+        column: 1,
+        message: 'Compilation failed: ' + e,
+      });
+    }
   }
 
   if (errorParser.errors.filter((e) => e.type === 'error').length) {
     return { errors: errorParser.errors };
   }
 
-  const jsonParser = new VerilogJSONParser();
+  let jsonContent = '';
   try {
-    const jsonContent = FS.readFile(jsonPath, { encoding: 'utf8' });
+    jsonContent = FS.readFile(jsonPath, { encoding: 'utf8' });
+    const parser = new VerilogJSONParser();
     try {
-      jsonParser.parse(jsonContent);
-    } catch (e) {
-      downloadRawFile(jsonContent, `V${opts.topModule}.json`);
-      throw e;
-    }
+      parser.setFileNames(JSON.parse(FS.readFile(metaPath, { encoding: 'utf8' })));
+    } catch {}
+    const output: VModel = parser.parse(jsonContent);
+    for (const w of output.warnings) console.warn(w);
+    return { errors: errorParser.errors, output };
   } catch (e) {
-    console.log(e, (e as Error).stack);
-
+    console.error(e);
+    if (isDebugMode() && jsonContent) downloadRawFile(jsonContent, `V${opts.topModule}.json`);
+    const loc = (e as { loc?: { path?: string; line?: number } }).loc;
     return {
       errors: [
         ...errorParser.errors,
         {
           type: 'error' as const,
-          file: '',
-          line: 1,
+          file: loc?.path?.replace(/^src\//, '') ?? '',
+          line: loc?.line ?? 1,
           column: 1,
-          message: 'JSON parsing failed: ' + e,
+          message: 'Simulation model generation failed: ' + (e instanceof Error ? e.message : e),
         },
       ],
     };
   }
-  return {
-    errors: errorParser.errors,
-    output: jsonParser,
-  };
 }

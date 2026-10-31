@@ -1,790 +1,336 @@
+/**
+ * Code generator tests at the IR level: every operator is checked against a
+ * BigInt reference implementation of Verilator's semantics, for random
+ * operands at many widths (narrow, 64-bit and wide).
+ *
+ * Verilator normally expands most wide operations into per-word code before
+ * the JSON dump, so these tests also cover paths that real designs rarely hit.
+ */
 import { describe, expect, test } from 'vitest';
-import {
-  HDLBinop,
-  HDLBlock,
-  HDLConstant,
-  HDLLogicType,
-  HDLModuleDef,
-  HDLUnop,
-  HDLVariableDef,
-  HDLVarRef,
-} from './hdltypes';
+import { VExpr, VLogicType, VModel, VStmt, VType, VVar } from './hdltypes';
 import { HDLModuleWASM } from './hdlwasm';
 
-/**
- * Helper to create an HDLLogicType for a given bit width
- */
-function makeLogicType(bits: number, signed = false): HDLLogicType {
-  return {
-    left: bits - 1,
-    right: 0,
-    signed,
-  };
-}
+let ids = 0;
+const logic = (width: number, signed = false): VLogicType => ({
+  kind: 'logic',
+  width,
+  widthMin: width,
+  signed,
+});
 
-/**
- * Helper to create an HDLVariableDef
- */
-function makeVarDef(
-  name: string,
-  bits: number,
-  options: { isInput?: boolean; isOutput?: boolean; signed?: boolean } = {},
-): HDLVariableDef {
+function mkvar(name: string, type: VType, dir: VVar['dir'] = 'none'): VVar {
   return {
+    id: `(V${ids++})`,
     name,
     origName: name,
-    dtype: makeLogicType(bits, options.signed),
-    isInput: options.isInput ?? false,
-    isOutput: options.isOutput ?? false,
-    isParam: false,
+    type,
+    scope: 'global',
+    byRef: false,
+    dir,
+    isPrimaryIO: dir !== 'none',
+    isConst: false,
   };
 }
+const ref = (v: VVar): VExpr => ({ k: 'var', t: v.type, v });
+const op = (o: string, t: VType, ...args: VExpr[]): VExpr => ({ k: 'op', op: o, t, args });
+const cst = (t: VType, value: bigint): VExpr => ({ k: 'const', t, value });
 
-/**
- * Helper to create a variable reference expression
- */
-function makeVarRef(name: string, bits: number, signed = false): HDLVarRef {
+function makeModel(vars: VVar[], body: VStmt[]): VModel {
   return {
-    refname: name,
-    dtype: makeLogicType(bits, signed),
+    vars,
+    funcs: [{ id: '(F)', name: '_eval', args: [], locals: [], body, ret: null }],
+    warnings: [],
   };
 }
 
-/**
- * Helper to create a constant expression
- */
-function makeConst(value: number | bigint, bits: number): HDLConstant {
-  if (typeof value === 'bigint') {
-    return {
-      cvalue: Number(value & BigInt(0xffffffff)),
-      bigvalue: value,
-      dtype: makeLogicType(bits),
+/** deterministic random BigInt of 'width' bits, biased towards edge values */
+function makeRng(seed = 12345n) {
+  let s = seed;
+  const next64 = () => {
+    s ^= (s << 13n) & 0xffffffffffffffffn;
+    s ^= s >> 7n;
+    s ^= (s << 17n) & 0xffffffffffffffffn;
+    return s;
+  };
+  return (width: number) => {
+    const mask = (1n << BigInt(width)) - 1n;
+    const kind = Number(next64() % 8n);
+    if (kind === 0) return 0n;
+    if (kind === 1) return mask;
+    if (kind === 2) return 1n << BigInt(width - 1); // most negative
+    if (kind === 3) return 1n;
+    let v = 0n;
+    for (let i = 0; i < width; i += 64) v = (v << 64n) | next64();
+    if (kind === 4) v >>= BigInt(Number(next64() % BigInt(width))); // small values
+    return v & mask;
+  };
+}
+
+const WIDTHS = [1, 7, 8, 16, 31, 32, 33, 48, 63, 64, 65, 96, 100, 127, 128, 200, 256];
+const SAMPLES = 40;
+
+const mask = (w: number) => (1n << BigInt(w)) - 1n;
+const toSigned = (v: bigint, w: number) => BigInt.asIntN(w, v);
+
+type Ref = (a: bigint, b: bigint, w: number) => bigint;
+const BINOPS: Record<string, Ref> = {
+  add: (a, b, w) => (a + b) & mask(w),
+  sub: (a, b, w) => (a - b) & mask(w),
+  mul: (a, b, w) => (a * b) & mask(w),
+  and: (a, b) => a & b,
+  or: (a, b) => a | b,
+  xor: (a, b) => a ^ b,
+  div: (a, b) => (b === 0n ? 0n : a / b),
+  moddiv: (a, b) => (b === 0n ? 0n : a % b),
+  divs: (a, b, w) => {
+    if (b === 0n) return 0n;
+    if (w === 32 || w === 64) {
+      // VL_DIVS_III/QQQ: -MAX / -1 is defined as 0
+      if (a === 1n << BigInt(w - 1) && b === mask(w)) return 0n;
+    }
+    return (toSigned(a, w) / toSigned(b, w)) & mask(w);
+  },
+  moddivs: (a, b, w) => {
+    if (b === 0n) return 0n;
+    if ((w === 32 || w === 64) && a === 1n << BigInt(w - 1) && b === mask(w)) return 0n;
+    return toSigned(a, w) % toSigned(b, w) & mask(w);
+  },
+  muls: (a, b, w) => (toSigned(a, w) * toSigned(b, w)) & mask(w),
+};
+const CMPOPS: Record<string, (a: bigint, b: bigint, w: number) => boolean> = {
+  eq: (a, b) => a === b,
+  neq: (a, b) => a !== b,
+  lt: (a, b) => a < b,
+  lte: (a, b) => a <= b,
+  gt: (a, b) => a > b,
+  gte: (a, b) => a >= b,
+  lts: (a, b, w) => toSigned(a, w) < toSigned(b, w),
+  ltes: (a, b, w) => toSigned(a, w) <= toSigned(b, w),
+  gts: (a, b, w) => toSigned(a, w) > toSigned(b, w),
+  gtes: (a, b, w) => toSigned(a, w) >= toSigned(b, w),
+};
+const SHIFTS: Record<string, (a: bigint, n: number, w: number) => bigint> = {
+  shiftl: (a, n, w) => (n >= w ? 0n : (a << BigInt(n)) & mask(w)),
+  shiftr: (a, n, w) => (n >= w ? 0n : a >> BigInt(n)),
+  shiftrs: (a, n, w) => (toSigned(a, w) >> BigInt(Math.min(n, w))) & mask(w),
+};
+const UNOPS: Record<string, (a: bigint, w: number) => bigint> = {
+  not: (a, w) => ~a & mask(w),
+  negate: (a, w) => -a & mask(w),
+  redor: (a) => (a !== 0n ? 1n : 0n),
+  redand: (a, w) => (a === mask(w) ? 1n : 0n),
+  redxor: (a) => BigInt(a.toString(2).split('1').length % 2 === 0 ? 1 : 0),
+};
+
+describe('code generator vs. BigInt reference', () => {
+  for (const w of WIDTHS) {
+    test(`${w}-bit operators`, async () => {
+      const t = logic(w);
+      const a = mkvar('a', t, 'input');
+      const b = mkvar('b', t, 'input');
+      const n = mkvar('n', logic(32), 'input');
+      const outs: { v: VVar; ref: (x: bigint, y: bigint, s: number) => bigint }[] = [];
+      const body: VStmt[] = [];
+      const add = (
+        name: string,
+        rt: VType,
+        e: VExpr,
+        r: (x: bigint, y: bigint, s: number) => bigint,
+      ) => {
+        const v = mkvar(name, rt, 'output');
+        outs.push({ v, ref: r });
+        body.push({ s: 'assign', lhs: ref(v), rhs: e });
+      };
+      for (const [name, r] of Object.entries(BINOPS)) {
+        add(`o_${name}`, t, op(name, t, ref(a), ref(b)), (x, y) => r(x, y, w));
+      }
+      for (const [name, r] of Object.entries(CMPOPS)) {
+        add(`o_${name}`, logic(1), op(name, logic(1), ref(a), ref(b)), (x, y) =>
+          r(x, y, w) ? 1n : 0n,
+        );
+      }
+      for (const [name, r] of Object.entries(SHIFTS)) {
+        add(`o_${name}`, t, op(name, t, ref(a), ref(n)), (x, _y, s) => r(x, s, w));
+        // shift by a constant
+        const k = Math.max(0, Math.min(w - 1, 5 + (w >> 1)));
+        add(`o_${name}_k`, t, op(name, t, ref(a), cst(logic(32), BigInt(k))), (x) => r(x, k, w));
+      }
+      for (const [name, r] of Object.entries(UNOPS)) {
+        const rt = name.startsWith('red') ? logic(1) : t;
+        add(`o_${name}`, rt, op(name, rt, ref(a)), (x) => r(x, w));
+      }
+      // conditional
+      add('o_cond', t, op('cond', t, op('lt', logic(1), ref(a), ref(b)), ref(a), ref(b)), (x, y) =>
+        x < y ? x : y,
+      );
+      // zero/sign extension to a wider type
+      const wt = logic(w + 37);
+      add('o_extend', wt, op('extend', wt, ref(a)), (x) => x);
+      add('o_extends', wt, op('extends', wt, ref(a)), (x) => toSigned(x, w) & mask(w + 37));
+      // concatenation and replication
+      const ct = logic(2 * w);
+      add('o_concat', ct, op('concat', ct, ref(a), ref(b)), (x, y) => (x << BigInt(w)) | y);
+      const rt = logic(3 * w);
+      add(
+        'o_repl',
+        rt,
+        op('replicate', rt, ref(a), cst(logic(32), 3n)),
+        (x) => (x << BigInt(2 * w)) | (x << BigInt(w)) | x,
+      );
+
+      const mod = new HDLModuleWASM(makeModel([a, b, n, ...outs.map((o) => o.v)], body));
+      await mod.init();
+      const rnd = makeRng(BigInt(w) * 7919n + 1n);
+      const failures: string[] = [];
+      for (let i = 0; i < SAMPLES; i++) {
+        const x = rnd(w);
+        const y = rnd(w);
+        const s = [0, 1, 31, 32, 33, 63, 64, 65, w - 1, w, w + 1, 1000][i % 12] ?? 0;
+        mod.state.a = x;
+        mod.state.b = y;
+        mod.state.n = Math.max(0, s);
+        mod.eval();
+        for (const o of outs) {
+          const ow = (o.v.type as VLogicType).width;
+          const expected = o.ref(x, y, Math.max(0, s)) & mask(ow);
+          const actual = BigInt(mod.state[o.v.name]) & mask(ow);
+          if (actual !== expected && failures.length < 10) {
+            failures.push(
+              `${o.v.name}(${x.toString(16)}, ${y.toString(16)}, n=${s}) = ${actual.toString(16)}, expected ${expected.toString(16)}`,
+            );
+          }
+        }
+      }
+      mod.dispose();
+      expect(failures).toEqual([]);
+    });
+  }
+
+  test('arrays of wide elements, word selects and creset', async () => {
+    const et = logic(100);
+    const arr = mkvar('arr', { kind: 'array', elem: et, count: 4, lo: 0 });
+    const idx = mkvar('idx', logic(2), 'input');
+    const val = mkvar('val', et, 'input');
+    const out = mkvar('out', et, 'output');
+    const word = mkvar('word', logic(32), 'output');
+    const sel = (e: VExpr) => op('arraysel', et, ref(arr), e);
+    const body: VStmt[] = [
+      { s: 'assign', lhs: sel(ref(idx)), rhs: op('add', et, ref(val), sel(ref(idx))) },
+      { s: 'assign', lhs: ref(out), rhs: sel(ref(idx)) },
+      {
+        s: 'assign',
+        lhs: ref(word),
+        rhs: op('wordsel', logic(32), sel(ref(idx)), cst(logic(32), 3n)),
+      },
+    ];
+    const mod = new HDLModuleWASM(makeModel([arr, idx, val, out, word], body));
+    await mod.init();
+    const v = (1n << 99n) | 0x123456789abcdefn;
+    mod.state.idx = 2;
+    mod.state.val = v;
+    mod.eval();
+    mod.eval();
+    expect(mod.state.out).toBe((2n * v) & mask(100));
+    expect(mod.state.word).toBe(Number(((2n * v) >> 96n) & 0xffffffffn));
+    mod.state.idx = 1;
+    mod.eval();
+    expect(mod.state.out).toBe(v);
+  });
+
+  test('functions with by-value, by-reference and returned values', async () => {
+    const t = logic(16);
+    const x = mkvar('x', t, 'input');
+    const y = mkvar('y', t, 'output');
+    const z = mkvar('z', logic(64), 'output');
+    // u16 f(u16 p, u64& r) { r = p * 3; return p + 1; }
+    const p: VVar = { ...mkvar('p', t), scope: 'arg' };
+    const r: VVar = { ...mkvar('r', logic(64)), scope: 'arg', byRef: true, dir: 'inout' };
+    const f = {
+      id: '(G)',
+      name: 'f',
+      args: [p, r],
+      locals: [],
+      ret: t,
+      body: [
+        {
+          s: 'assign',
+          lhs: ref(r),
+          rhs: op('mul', logic(64), op('extend', logic(64), ref(p)), cst(logic(64), 3n)),
+        },
+        { s: 'return', value: op('add', t, ref(p), cst(t, 1n)) },
+      ] as VStmt[],
     };
-  }
-  return {
-    cvalue: value,
-    bigvalue: BigInt(value),
-    dtype: makeLogicType(bits),
-  };
-}
-
-/**
- * Helper to create a binary operation expression
- */
-function makeBinop(
-  op: string,
-  left: HDLVarRef | HDLConstant,
-  right: HDLVarRef | HDLConstant,
-  resultBits: number,
-): HDLBinop {
-  return {
-    op,
-    left,
-    right,
-    dtype: makeLogicType(resultBits),
-  };
-}
-
-/**
- * Helper to create an assignment expression
- */
-function makeAssign(
-  destName: string,
-  destBits: number,
-  src: HDLBinop | HDLVarRef | HDLConstant,
-): HDLBinop {
-  return {
-    op: 'assign',
-    left: src,
-    right: makeVarRef(destName, destBits),
-    dtype: makeLogicType(destBits),
-  };
-}
-
-/**
- * Helper to create a minimal HDLModuleDef for testing
- */
-function makeModule(
-  vardefs: HDLVariableDef[],
-  evalExprs: (HDLBinop | HDLUnop)[] = [],
-): HDLModuleDef {
-  const vardefsMap: { [id: string]: HDLVariableDef } = {};
-  for (const vd of vardefs) {
-    vardefsMap[vd.name] = vd;
-  }
-
-  // Create minimal required blocks
-  const blocks: HDLBlock[] = [
-    { blocktype: 'initial', name: '_ctor_var_reset', exprs: [] },
-    { blocktype: 'initial', name: '_eval_initial', exprs: [] },
-    { blocktype: 'initial', name: '_eval_settle', exprs: [] },
-    { blocktype: 'comb', name: '_eval', exprs: evalExprs },
-    { blocktype: 'comb', name: '_change_request', exprs: [] },
-  ];
-
-  return {
-    name: 'test_module',
-    origName: 'test_module',
-    blocks,
-    instances: [],
-    vardefs: vardefsMap,
-  };
-}
-
-describe('HDLModuleWASM', () => {
-  describe('Standard operations (<=64 bits)', () => {
-    test('should compile module with 32-bit signals', async () => {
-      const mod = new HDLModuleWASM(
-        makeModule([makeVarDef('clk', 1, { isInput: true }), makeVarDef('counter', 32)]),
-        null,
-      );
-      await mod.init();
-
-      mod.powercycle();
-      expect(mod.state.counter).toBe(0);
-
-      mod.dispose();
-    });
-
-    test('should compile module with 64-bit signals', async () => {
-      const mod = new HDLModuleWASM(
-        makeModule([makeVarDef('clk', 1, { isInput: true }), makeVarDef('counter', 64)]),
-        null,
-      );
-      await mod.init();
-
-      mod.powercycle();
-      // 33..64-bit values return as BigInt, matching the wide-value convention.
-      const val = mod.state.counter;
-      expect(typeof val).toBe('bigint');
-      expect(val).toBe(0n);
-
-      mod.dispose();
-    });
+    const call: VExpr = { k: 'call', t, func: f, args: [ref(x), ref(z)] };
+    const model: VModel = {
+      vars: [x, y, z],
+      funcs: [
+        f,
+        {
+          id: '(F)',
+          name: '_eval',
+          args: [],
+          locals: [],
+          ret: null,
+          body: [{ s: 'assign', lhs: ref(y), rhs: call }],
+        },
+      ],
+      warnings: [],
+    };
+    const mod = new HDLModuleWASM(model);
+    await mod.init();
+    mod.state.x = 0xffff;
+    mod.eval();
+    expect(mod.state.y).toBe(0);
+    expect(mod.state.z).toBe(0xffffn * 3n);
   });
 
-  describe('Wide signals (>64 bits)', () => {
-    test('should compile module with 65-bit signal', async () => {
-      const mod = new HDLModuleWASM(
-        makeModule([makeVarDef('clk', 1, { isInput: true }), makeVarDef('wide', 65)]),
-        null,
-      );
-      await mod.init();
-
-      mod.powercycle();
-      // Wide values should return as BigInt
-      const val = mod.state.wide;
-      expect(typeof val).toBe('bigint');
-      expect(val).toBe(0n);
-
-      mod.dispose();
-    });
-
-    test('should compile module with 96-bit signal', async () => {
-      const mod = new HDLModuleWASM(
-        makeModule([makeVarDef('clk', 1, { isInput: true }), makeVarDef('wide', 96)]),
-        null,
-      );
-      await mod.init();
-
-      mod.powercycle();
-      const val = mod.state.wide;
-      expect(typeof val).toBe('bigint');
-      expect(val).toBe(0n);
-
-      mod.dispose();
-    });
-
-    test('should compile module with 128-bit signal', async () => {
-      const mod = new HDLModuleWASM(
-        makeModule([makeVarDef('clk', 1, { isInput: true }), makeVarDef('wide', 128)]),
-        null,
-      );
-      await mod.init();
-
-      mod.powercycle();
-      const val = mod.state.wide;
-      expect(typeof val).toBe('bigint');
-      expect(val).toBe(0n);
-
-      mod.dispose();
-    });
-
-    test('should set and get 65-bit value via BigInt', async () => {
-      const mod = new HDLModuleWASM(
-        makeModule([makeVarDef('clk', 1, { isInput: true }), makeVarDef('wide', 65)]),
-        null,
-      );
-      await mod.init();
-
-      mod.powercycle();
-
-      // Set a value that uses the 65th bit
-      const testValue = (1n << 64n) | 0x123456789abcdef0n;
-      mod.state.wide = testValue;
-
-      const readBack = mod.state.wide;
-      expect(readBack).toBe(testValue);
-
-      mod.dispose();
-    });
-
-    test('should set and get 128-bit value via BigInt', async () => {
-      const mod = new HDLModuleWASM(
-        makeModule([makeVarDef('clk', 1, { isInput: true }), makeVarDef('wide', 128)]),
-        null,
-      );
-      await mod.init();
-
-      mod.powercycle();
-
-      // Set a large 128-bit value
-      const testValue = (1n << 127n) | (1n << 64n) | 0xfedcba9876543210n;
-      mod.state.wide = testValue;
-
-      const readBack = mod.state.wide;
-      expect(readBack).toBe(testValue);
-
-      mod.dispose();
-    });
+  test('loops with looptest and jump blocks', async () => {
+    const t = logic(32);
+    const n = mkvar('n', t, 'input');
+    const sum = mkvar('sum', t, 'output');
+    const i: VVar = { ...mkvar('i', t), scope: 'local' };
+    // sum = 0; i = 0; loop { looptest(i < n); sum += i; if (i == 100) jumpgo; i++ }
+    const body: VStmt[] = [
+      { s: 'assign', lhs: ref(sum), rhs: cst(t, 0n) },
+      { s: 'assign', lhs: ref(i), rhs: cst(t, 0n) },
+      {
+        s: 'jumpblock',
+        id: 'J1',
+        body: [
+          {
+            s: 'loop',
+            body: [
+              { s: 'looptest', cond: op('lt', logic(1), ref(i), ref(n)) },
+              { s: 'assign', lhs: ref(sum), rhs: op('add', t, ref(sum), ref(i)) },
+              {
+                s: 'if',
+                cond: op('eq', logic(1), ref(i), cst(t, 100n)),
+                then: [{ s: 'jumpgo', id: 'J1' }],
+                else: [],
+              },
+              { s: 'assign', lhs: ref(i), rhs: op('add', t, ref(i), cst(t, 1n)) },
+            ],
+          },
+        ],
+      },
+    ];
+    const model = makeModel([n, sum], body);
+    model.funcs[0].locals.push(i);
+    const mod = new HDLModuleWASM(model);
+    await mod.init();
+    mod.state.n = 10;
+    mod.eval();
+    expect(mod.state.sum).toBe(45);
+    mod.state.n = 1000;
+    mod.eval();
+    expect(mod.state.sum).toBe(5050);
   });
 
-  describe('Wide operations', () => {
-    test('should perform wide addition', async () => {
-      // Create a module that adds two 96-bit values
-      const mod = new HDLModuleWASM(
-        makeModule(
-          [
-            makeVarDef('clk', 1, { isInput: true }),
-            makeVarDef('a', 96),
-            makeVarDef('b', 96),
-            makeVarDef('result', 96, { isOutput: true }),
-          ],
-          [
-            makeAssign(
-              'result',
-              96,
-              makeBinop('add', makeVarRef('a', 96), makeVarRef('b', 96), 96),
-            ),
-          ],
-        ),
-        null,
-      );
-      await mod.init();
-
-      mod.powercycle();
-
-      // Test simple addition
-      mod.state.a = 100n;
-      mod.state.b = 200n;
-      mod.eval();
-      expect(mod.state.result).toBe(300n);
-
-      // Test addition with carry
-      mod.state.a = 0xffffffff_ffffffffn; // 64 bits of 1s
-      mod.state.b = 1n;
-      mod.eval();
-      expect(mod.state.result).toBe(0x1_00000000_00000000n);
-
-      mod.dispose();
-    });
-
-    test('should perform wide subtraction', async () => {
-      const mod = new HDLModuleWASM(
-        makeModule(
-          [
-            makeVarDef('clk', 1, { isInput: true }),
-            makeVarDef('a', 96),
-            makeVarDef('b', 96),
-            makeVarDef('result', 96, { isOutput: true }),
-          ],
-          [
-            makeAssign(
-              'result',
-              96,
-              makeBinop('sub', makeVarRef('a', 96), makeVarRef('b', 96), 96),
-            ),
-          ],
-        ),
-        null,
-      );
-      await mod.init();
-
-      mod.powercycle();
-
-      // Test simple subtraction
-      mod.state.a = 300n;
-      mod.state.b = 100n;
-      mod.eval();
-      expect(mod.state.result).toBe(200n);
-
-      // Test subtraction with borrow
-      mod.state.a = 0x1_00000000_00000000n;
-      mod.state.b = 1n;
-      mod.eval();
-      expect(mod.state.result).toBe(0xffffffff_ffffffffn);
-
-      mod.dispose();
-    });
-
-    test('should perform wide bitwise OR', async () => {
-      const mod = new HDLModuleWASM(
-        makeModule(
-          [
-            makeVarDef('clk', 1, { isInput: true }),
-            makeVarDef('a', 96),
-            makeVarDef('b', 96),
-            makeVarDef('result', 96, { isOutput: true }),
-          ],
-          [makeAssign('result', 96, makeBinop('or', makeVarRef('a', 96), makeVarRef('b', 96), 96))],
-        ),
-        null,
-      );
-      await mod.init();
-
-      mod.powercycle();
-
-      mod.state.a = 0xf0f0f0f0_f0f0f0f0_f0f0f0f0n;
-      mod.state.b = 0x0f0f0f0f_0f0f0f0f_0f0f0f0fn;
-      mod.eval();
-      expect(mod.state.result).toBe(0xffffffff_ffffffff_ffffffffn);
-
-      mod.dispose();
-    });
-
-    test('should perform wide bitwise AND', async () => {
-      const mod = new HDLModuleWASM(
-        makeModule(
-          [
-            makeVarDef('clk', 1, { isInput: true }),
-            makeVarDef('a', 96),
-            makeVarDef('b', 96),
-            makeVarDef('result', 96, { isOutput: true }),
-          ],
-          [
-            makeAssign(
-              'result',
-              96,
-              makeBinop('and', makeVarRef('a', 96), makeVarRef('b', 96), 96),
-            ),
-          ],
-        ),
-        null,
-      );
-      await mod.init();
-
-      mod.powercycle();
-
-      mod.state.a = 0xffffffff_00000000_ffffffffn;
-      mod.state.b = 0x12345678_12345678_12345678n;
-      mod.eval();
-      expect(mod.state.result).toBe(0x12345678_00000000_12345678n);
-
-      mod.dispose();
-    });
-
-    test('should perform wide bitwise XOR', async () => {
-      const mod = new HDLModuleWASM(
-        makeModule(
-          [
-            makeVarDef('clk', 1, { isInput: true }),
-            makeVarDef('a', 96),
-            makeVarDef('b', 96),
-            makeVarDef('result', 96, { isOutput: true }),
-          ],
-          [
-            makeAssign(
-              'result',
-              96,
-              makeBinop('xor', makeVarRef('a', 96), makeVarRef('b', 96), 96),
-            ),
-          ],
-        ),
-        null,
-      );
-      await mod.init();
-
-      mod.powercycle();
-
-      mod.state.a = 0xffffffff_ffffffff_ffffffffn;
-      mod.state.b = 0x12345678_12345678_12345678n;
-      mod.eval();
-      expect(mod.state.result).toBe(0xedcba987_edcba987_edcba987n);
-
-      mod.dispose();
-    });
-
-    test('should perform wide left shift by constant', async () => {
-      // Test shift by 4 bits
-      const mod1 = new HDLModuleWASM(
-        makeModule(
-          [
-            makeVarDef('clk', 1, { isInput: true }),
-            makeVarDef('a', 96),
-            makeVarDef('result', 96, { isOutput: true }),
-          ],
-          [makeAssign('result', 96, makeBinop('shiftl', makeVarRef('a', 96), makeConst(4, 8), 96))],
-        ),
-        null,
-      );
-      await mod1.init();
-      mod1.powercycle();
-
-      mod1.state.a = 0x123456789abcdef0n;
-      mod1.eval();
-      expect(mod1.state.result).toBe(0x123456789abcdef0n << 4n);
-      mod1.dispose();
-
-      // Test shift across word boundary (32 bits)
-      const mod2 = new HDLModuleWASM(
-        makeModule(
-          [
-            makeVarDef('clk', 1, { isInput: true }),
-            makeVarDef('a', 96),
-            makeVarDef('result', 96, { isOutput: true }),
-          ],
-          [
-            makeAssign(
-              'result',
-              96,
-              makeBinop('shiftl', makeVarRef('a', 96), makeConst(32, 8), 96),
-            ),
-          ],
-        ),
-        null,
-      );
-      await mod2.init();
-      mod2.powercycle();
-
-      mod2.state.a = 0xffffffffn;
-      mod2.eval();
-      expect(mod2.state.result).toBe(0xffffffff_00000000n);
-      mod2.dispose();
-    });
-
-    test('should perform wide right shift by constant', async () => {
-      // Test shift by 4 bits
-      const mod1 = new HDLModuleWASM(
-        makeModule(
-          [
-            makeVarDef('clk', 1, { isInput: true }),
-            makeVarDef('a', 96),
-            makeVarDef('result', 96, { isOutput: true }),
-          ],
-          [makeAssign('result', 96, makeBinop('shiftr', makeVarRef('a', 96), makeConst(4, 8), 96))],
-        ),
-        null,
-      );
-      await mod1.init();
-      mod1.powercycle();
-
-      mod1.state.a = 0x123456789abcdef0n;
-      mod1.eval();
-      expect(mod1.state.result).toBe(0x123456789abcdef0n >> 4n);
-      mod1.dispose();
-
-      // Test shift across word boundary (32 bits)
-      const mod2 = new HDLModuleWASM(
-        makeModule(
-          [
-            makeVarDef('clk', 1, { isInput: true }),
-            makeVarDef('a', 96),
-            makeVarDef('result', 96, { isOutput: true }),
-          ],
-          [
-            makeAssign(
-              'result',
-              96,
-              makeBinop('shiftr', makeVarRef('a', 96), makeConst(32, 8), 96),
-            ),
-          ],
-        ),
-        null,
-      );
-      await mod2.init();
-      mod2.powercycle();
-
-      mod2.state.a = 0xffffffff_00000000n;
-      mod2.eval();
-      expect(mod2.state.result).toBe(0xffffffffn);
-      mod2.dispose();
-    });
-
-    test('should perform wide left shift by variable amount', async () => {
-      const mod = new HDLModuleWASM(
-        makeModule(
-          [
-            makeVarDef('clk', 1, { isInput: true }),
-            makeVarDef('a', 96),
-            makeVarDef('shift', 8),
-            makeVarDef('result', 96, { isOutput: true }),
-          ],
-          [
-            makeAssign(
-              'result',
-              96,
-              makeBinop('shiftl', makeVarRef('a', 96), makeVarRef('shift', 8), 96),
-            ),
-          ],
-        ),
-        null,
-      );
-      await mod.init();
-      mod.powercycle();
-
-      // Test small shift (within first chunk)
-      mod.state.a = 0x123456789abcdef0n;
-      mod.state.shift = 4;
-      mod.eval();
-      expect(mod.state.result).toBe(0x123456789abcdef0n << 4n);
-
-      // Test shift across word boundary
-      mod.state.a = 0x1n;
-      mod.state.shift = 32;
-      mod.eval();
-      expect(mod.state.result).toBe(0x100000000n);
-
-      // Test shift by exactly 64 bits
-      mod.state.a = 0xffn;
-      mod.state.shift = 64;
-      mod.eval();
-      expect(mod.state.result).toBe(0xff_00000000_00000000n);
-
-      // Test shift by non-aligned amount crossing boundaries
-      mod.state.a = 0x12345678_9abcdef0n;
-      mod.state.shift = 17;
-      mod.eval();
-      expect(mod.state.result).toBe((0x12345678_9abcdef0n << 17n) & ((1n << 96n) - 1n));
-
-      // Test shift by 0 (should be identity)
-      mod.state.a = 0xaabbccdd_eeff0011n;
-      mod.state.shift = 0;
-      mod.eval();
-      expect(mod.state.result).toBe(0xaabbccdd_eeff0011n);
-
-      mod.dispose();
-    });
-
-    test('should perform wide right shift by variable amount', async () => {
-      const mod = new HDLModuleWASM(
-        makeModule(
-          [
-            makeVarDef('clk', 1, { isInput: true }),
-            makeVarDef('a', 96),
-            makeVarDef('shift', 8),
-            makeVarDef('result', 96, { isOutput: true }),
-          ],
-          [
-            makeAssign(
-              'result',
-              96,
-              makeBinop('shiftr', makeVarRef('a', 96), makeVarRef('shift', 8), 96),
-            ),
-          ],
-        ),
-        null,
-      );
-      await mod.init();
-      mod.powercycle();
-
-      // Test small shift (within first chunk)
-      mod.state.a = 0x123456789abcdef0n;
-      mod.state.shift = 4;
-      mod.eval();
-      expect(mod.state.result).toBe(0x123456789abcdef0n >> 4n);
-
-      // Test shift across word boundary
-      mod.state.a = 0x100000000n;
-      mod.state.shift = 32;
-      mod.eval();
-      expect(mod.state.result).toBe(0x1n);
-
-      // Test shift by exactly 64 bits
-      mod.state.a = 0xff_00000000_00000000n;
-      mod.state.shift = 64;
-      mod.eval();
-      expect(mod.state.result).toBe(0xffn);
-
-      // Test shift by non-aligned amount crossing boundaries
-      mod.state.a = 0x12345678_9abcdef0_aabbccddn;
-      mod.state.shift = 17;
-      mod.eval();
-      expect(mod.state.result).toBe(0x12345678_9abcdef0_aabbccddn >> 17n);
-
-      // Test shift by 0 (should be identity)
-      mod.state.a = 0xaabbccdd_eeff0011n;
-      mod.state.shift = 0;
-      mod.eval();
-      expect(mod.state.result).toBe(0xaabbccdd_eeff0011n);
-
-      mod.dispose();
-    });
-
-    test('should handle wide variable shift edge cases', async () => {
-      const mod = new HDLModuleWASM(
-        makeModule(
-          [
-            makeVarDef('clk', 1, { isInput: true }),
-            makeVarDef('a', 128),
-            makeVarDef('shift', 8),
-            makeVarDef('left_result', 128, { isOutput: true }),
-            makeVarDef('right_result', 128, { isOutput: true }),
-          ],
-          [
-            makeAssign(
-              'left_result',
-              128,
-              makeBinop('shiftl', makeVarRef('a', 128), makeVarRef('shift', 8), 128),
-            ),
-            makeAssign(
-              'right_result',
-              128,
-              makeBinop('shiftr', makeVarRef('a', 128), makeVarRef('shift', 8), 128),
-            ),
-          ],
-        ),
-        null,
-      );
-      await mod.init();
-      mod.powercycle();
-
-      // Test with all 1s - shift left
-      mod.state.a = (1n << 128n) - 1n;
-      mod.state.shift = 1;
-      mod.eval();
-      expect(mod.state.left_result).toBe((((1n << 128n) - 1n) << 1n) & ((1n << 128n) - 1n));
-
-      // Test with all 1s - shift right
-      mod.state.a = (1n << 128n) - 1n;
-      mod.state.shift = 1;
-      mod.eval();
-      expect(mod.state.right_result).toBe(((1n << 128n) - 1n) >> 1n);
-
-      // Test shift amount equals chunk boundary (32)
-      mod.state.a = 0xdeadbeef_cafebabe_12345678_aabbccddn;
-      mod.state.shift = 32;
-      mod.eval();
-      expect(mod.state.left_result).toBe(
-        (0xdeadbeef_cafebabe_12345678_aabbccddn << 32n) & ((1n << 128n) - 1n),
-      );
-      expect(mod.state.right_result).toBe(0xdeadbeef_cafebabe_12345678_aabbccddn >> 32n);
-
-      // Test shift amount equals multiple chunk boundaries (64)
-      mod.state.a = 0xdeadbeef_cafebabe_12345678_aabbccddn;
-      mod.state.shift = 64;
-      mod.eval();
-      expect(mod.state.left_result).toBe(
-        (0xdeadbeef_cafebabe_12345678_aabbccddn << 64n) & ((1n << 128n) - 1n),
-      );
-      expect(mod.state.right_result).toBe(0xdeadbeef_cafebabe_12345678_aabbccddn >> 64n);
-
-      // Test shift by 31 (one less than chunk boundary)
-      mod.state.a = 0x12345678_9abcdef0_11223344_55667788n;
-      mod.state.shift = 31;
-      mod.eval();
-      expect(mod.state.left_result).toBe(
-        (0x12345678_9abcdef0_11223344_55667788n << 31n) & ((1n << 128n) - 1n),
-      );
-      expect(mod.state.right_result).toBe(0x12345678_9abcdef0_11223344_55667788n >> 31n);
-
-      // Test shift by 33 (one more than chunk boundary)
-      mod.state.a = 0x12345678_9abcdef0_11223344_55667788n;
-      mod.state.shift = 33;
-      mod.eval();
-      expect(mod.state.left_result).toBe(
-        (0x12345678_9abcdef0_11223344_55667788n << 33n) & ((1n << 128n) - 1n),
-      );
-      expect(mod.state.right_result).toBe(0x12345678_9abcdef0_11223344_55667788n >> 33n);
-
-      mod.dispose();
-    });
-
-    test('should perform wide equality comparison', async () => {
-      const mod = new HDLModuleWASM(
-        makeModule(
-          [
-            makeVarDef('clk', 1, { isInput: true }),
-            makeVarDef('a', 96),
-            makeVarDef('b', 96),
-            makeVarDef('result', 1, { isOutput: true }),
-          ],
-          [makeAssign('result', 1, makeBinop('eq', makeVarRef('a', 96), makeVarRef('b', 96), 1))],
-        ),
-        null,
-      );
-      await mod.init();
-
-      mod.powercycle();
-
-      // Equal values
-      mod.state.a = 0x123456789abcdef0_12345678n;
-      mod.state.b = 0x123456789abcdef0_12345678n;
-      mod.eval();
-      expect(mod.state.result).toBe(1);
-
-      // Different values
-      mod.state.b = 0x123456789abcdef0_12345679n;
-      mod.eval();
-      expect(mod.state.result).toBe(0);
-
-      mod.dispose();
-    });
-
-    test('should perform wide less-than comparison', async () => {
-      const mod = new HDLModuleWASM(
-        makeModule(
-          [
-            makeVarDef('clk', 1, { isInput: true }),
-            makeVarDef('a', 96),
-            makeVarDef('b', 96),
-            makeVarDef('result', 1, { isOutput: true }),
-          ],
-          [makeAssign('result', 1, makeBinop('lt', makeVarRef('a', 96), makeVarRef('b', 96), 1))],
-        ),
-        null,
-      );
-      await mod.init();
-
-      mod.powercycle();
-
-      // a < b
-      mod.state.a = 0x100n;
-      mod.state.b = 0x200n;
-      mod.eval();
-      expect(mod.state.result).toBe(1);
-
-      // a >= b
-      mod.state.a = 0x200n;
-      mod.state.b = 0x100n;
-      mod.eval();
-      expect(mod.state.result).toBe(0);
-
-      // Equal values
-      mod.state.a = 0x100n;
-      mod.state.b = 0x100n;
-      mod.eval();
-      expect(mod.state.result).toBe(0);
-
-      mod.dispose();
-    });
-
-    test('should load wide constant', async () => {
-      const wideConst = 0x123456789abcdef0_fedcba98n;
-      const mod = new HDLModuleWASM(
-        makeModule(
-          [makeVarDef('clk', 1, { isInput: true }), makeVarDef('result', 96, { isOutput: true })],
-          [makeAssign('result', 96, makeConst(wideConst, 96))],
-        ),
-        null,
-      );
-      await mod.init();
-
-      mod.powercycle();
-      mod.eval();
-
-      expect(mod.state.result).toBe(wideConst);
-
-      mod.dispose();
-    });
+  test('fatal errors stop the simulation with a message', async () => {
+    const body: VStmt[] = [{ s: 'fatal', msg: 'DIDNOTCONVERGE: test' }];
+    const mod = new HDLModuleWASM(makeModel([mkvar('o', logic(8), 'output')], body));
+    await mod.init();
+    expect(() => mod.eval()).toThrow(/DIDNOTCONVERGE: test/);
+    expect(mod.isStopped()).toBe(true);
   });
 });

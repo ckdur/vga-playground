@@ -1,12 +1,20 @@
 import { EmuHalt, SourceLocation } from './emu';
 
+/**
+ * Intermediate representation of a Verilated model.
+ *
+ * The IR mirrors the C++ code that Verilator would emit (after V3Clean,
+ * V3Expand etc.), since that is what Verilator's final JSON tree describes:
+ * a set of C functions operating on C-sized integers (CData/SData/IData/QData),
+ * wide values (VlWide, arrays of 32-bit words) and unpacked arrays.
+ */
+
 export class HDLError extends EmuHalt {
   obj: any;
   constructor(obj: any, msg: string) {
-    super(msg, obj ? obj.$loc : null);
+    super(msg, obj && obj.loc ? obj.loc : undefined);
     Object.setPrototypeOf(this, HDLError.prototype);
     this.obj = obj;
-    if (obj) console.log(obj);
   }
 }
 
@@ -25,235 +33,176 @@ export interface HDLModuleRunner {
   getFileData: ((filename: string) => string | Uint8Array | undefined) | null;
 }
 
-export interface HDLModuleTrace extends HDLModuleRunner {
-  trace: any;
-  resetTrace(): void;
-  nextTrace(): void;
-}
+// --- Types ---
 
-///
-
-export interface HDLLogicType extends HDLSourceObject {
-  left: number;
-  right: number;
-  signed: boolean;
-}
-
-export interface HDLVlTriggerVecType extends HDLSourceObject {
-  left: number;
-  right: number;
-  signed: boolean;
-}
-
-export interface HDLUnpackArray extends HDLSourceObject {
-  subtype: HDLDataType;
-  low: HDLConstant;
-  high: HDLConstant;
-}
-
-export interface HDLNativeType extends HDLSourceObject {
-  jstype: string;
-}
-
-export type HDLDataType = HDLLogicType | HDLUnpackArray | HDLNativeType;
-
-export function isLogicType(arg: any): arg is HDLLogicType {
-  return typeof arg.left === 'number' && typeof arg.right === 'number';
-}
-
-export function isArrayType(arg: any): arg is HDLUnpackArray {
-  return (
-    arg.subtype != null &&
-    arg.low != null &&
-    arg.high != null &&
-    typeof arg.low.cvalue === 'number' &&
-    typeof arg.high.cvalue === 'number'
-  );
-}
-
-export interface HDLFile {
-  id: string;
-  filename: string;
-  isModule: boolean;
-}
-
-export interface HDLSourceLocation extends SourceLocation {
-  hdlfile: HDLFile;
-  end_line?: number;
-}
-
-export interface HDLSourceObject {
-  $loc?: HDLSourceLocation;
-}
-
-export interface HDLDataTypeObject extends HDLSourceObject {
-  dtype: HDLDataType;
-}
-
-export function hasDataType(arg: any): arg is HDLDataTypeObject {
-  return typeof arg.dtype === 'object';
-}
-
-export interface HDLModuleDef extends HDLSourceObject {
-  name: string;
-  origName: string;
-  blocks: HDLBlock[];
-  instances: HDLInstanceDef[];
-  vardefs: { [id: string]: HDLVariableDef };
-  constdefs?: { [id: string]: HDLConstant };
-}
-
-export interface HDLVariableDef extends HDLDataTypeObject {
-  name: string;
-  origName: string;
-  isInput: boolean;
-  isOutput: boolean;
-  isParam: boolean;
-  constValue?: HDLConstant;
-  initValue?: HDLBlock;
-}
-
-export function isVarDecl(arg: any): arg is HDLVariableDef {
-  return typeof arg.isParam !== 'undefined';
-}
-
-export interface HDLConstant extends HDLDataTypeObject {
-  cvalue: number;
-  bigvalue: bigint;
-  /** Original bit width from Verilog literal (e.g., 28 for 28'sh4000) */
-  origWidth?: number;
-}
-
-export function isConstExpr(arg: any): arg is HDLConstant {
-  return typeof arg.cvalue === 'number';
-}
-
-export function isBigConstExpr(arg: any): arg is HDLConstant {
-  return typeof arg.bigvalue === 'bigint';
-}
-
-export interface HDLHierarchyDef extends HDLSourceObject {
-  name: string;
-  module: HDLModuleDef;
-  parent: HDLHierarchyDef;
-  children: HDLHierarchyDef[];
-}
-
-export interface HDLInstanceDef extends HDLSourceObject {
-  name: string;
-  origName: string;
-  module: HDLModuleDef;
-  ports: HDLPort[];
-}
-
-export interface HDLVarRef extends HDLDataTypeObject {
-  refname: string;
-  //TODO? vardef: HDLVariableDef;
-}
-
-export function isVarRef(arg: any): arg is HDLVarRef {
-  return arg.refname != null;
-}
-
-export interface HDLUnop extends HDLDataTypeObject {
-  op: string;
-  left: HDLExpr;
-}
-
-export interface HDLExtendop extends HDLUnop {
+/** Packed integral value (bit/logic vector, CData/SData/IData/QData, VlWide) */
+export interface VLogicType {
+  kind: 'logic';
   width: number;
-  widthminv: number;
+  /** Verilator's widthMin(), passed as 'lbits' to signed helpers */
+  widthMin: number;
+  signed: boolean;
 }
 
-export function isUnop(arg: any): arg is HDLUnop {
-  return arg.op != null && arg.left != null && arg.right == null;
+/** Unpacked array (VlUnpacked<T, N>) */
+export interface VArrayType {
+  kind: 'array';
+  elem: VType;
+  /** number of elements */
+  count: number;
+  /** lowest declared index (informational, Verilator indexes from 0) */
+  lo: number;
 }
 
-export interface HDLBinop extends HDLUnop {
-  right: HDLExpr;
-}
-
-export function isBinop(arg: any): arg is HDLBinop {
-  return arg.op != null && arg.left != null && arg.right != null && arg.cond == null;
-}
-
-export interface HDLTriop extends HDLBinop {
-  cond: HDLExpr;
-}
-
-export function isTriop(arg: any): arg is HDLTriop {
-  return arg.op != null && arg.cond != null;
-}
-
-export interface HDLWhileOp extends HDLDataTypeObject {
-  op: 'while';
-  precond: HDLExpr;
-  loopcond: HDLExpr;
-  body: HDLExpr;
-  inc: HDLExpr;
-}
-
-export function isWhileop(arg: any): arg is HDLWhileOp {
-  return arg.op === 'while' && arg.loopcond != null;
-}
-
-export interface HDLBlock extends HDLSourceObject {
-  blocktype: string;
+export interface VOtherType {
+  kind: 'void' | 'string' | 'real' | 'unsupported';
   name: string;
-  exprs: HDLExpr[];
 }
 
-export function isBlock(arg: any): arg is HDLBlock {
-  return arg.blocktype != null;
+export type VType = VLogicType | VArrayType | VOtherType;
+
+export function isLogic(t: VType | undefined): t is VLogicType {
+  return !!t && t.kind === 'logic';
 }
 
-export interface HDLAlwaysBlock extends HDLBlock {
-  senlist: HDLSensItem[];
+export function isArray(t: VType | undefined): t is VArrayType {
+  return !!t && t.kind === 'array';
 }
 
-export interface HDLSensItem extends HDLSourceObject {
-  edgeType: 'POS' | 'NEG';
-  expr: HDLExpr;
+/** Values wider than 64 bits are stored as arrays of 32-bit words */
+export function isWide(t: VType | undefined): boolean {
+  return isLogic(t) && t.width > 64;
 }
 
-export interface HDLPort extends HDLSourceObject {
+export function numWords(t: VLogicType): number {
+  return Math.ceil(t.width / 32);
+}
+
+/** Size in bytes of the storage for a type (matches Verilator's C types) */
+export function typeSize(t: VType): number {
+  if (isLogic(t)) {
+    if (t.width <= 8) return 1;
+    if (t.width <= 16) return 2;
+    if (t.width <= 32) return 4;
+    if (t.width <= 64) return 8;
+    return numWords(t) * 4;
+  }
+  if (isArray(t)) return t.count * typeSize(t.elem);
+  return 0;
+}
+
+/** Alignment in bytes of the storage for a type */
+export function typeAlign(t: VType): number {
+  if (isLogic(t)) return Math.min(typeSize(t), 8);
+  if (isArray(t)) return typeAlign(t.elem);
+  return 1;
+}
+
+// --- Variables and functions ---
+
+export type VVarScope = 'global' | 'local' | 'arg';
+export type VDirection = 'input' | 'output' | 'inout' | 'none';
+
+export type VInit =
+  | { kind: 'const'; value: bigint }
+  | { kind: 'array'; items: Map<number, VInit>; dflt?: VInit };
+
+export interface VSourceLocation extends SourceLocation {}
+
+export interface VVar {
+  id: string;
+  /** C identifier (unique within its scope) */
   name: string;
-  expr: HDLExpr;
+  /** Pretty (Verilog) name */
+  origName: string;
+  type: VType;
+  scope: VVarScope;
+  /** Function argument passed by reference (pointer) */
+  byRef: boolean;
+  dir: VDirection;
+  /** Top-level I/O port */
+  isPrimaryIO: boolean;
+  /** Constant (e.g. constant pool tables), initialized once */
+  isConst: boolean;
+  init?: VInit;
+  loc?: VSourceLocation;
 }
 
-export interface HDLFuncCall extends HDLDataTypeObject {
-  funcname: string;
-  args: HDLExpr[];
+export interface VConst {
+  k: 'const';
+  t: VType;
+  value: bigint;
+  /** set for string literals */
+  str?: string;
+  loc?: VSourceLocation;
 }
 
-export function isFuncCall(arg: any): arg is HDLFuncCall {
-  return typeof arg.funcname === 'string';
+export interface VVarRef {
+  k: 'var';
+  t: VType;
+  v: VVar;
+  loc?: VSourceLocation;
 }
 
-export interface HDLArrayItem {
-  index: number;
-  expr: HDLExpr;
+export interface VOp {
+  k: 'op';
+  op: string;
+  t: VType;
+  args: VExpr[];
+  loc?: VSourceLocation;
 }
 
-export function isArrayItem(arg: any): arg is HDLArrayItem {
-  return typeof arg.index === 'number' && arg.expr != null;
+export interface VCall {
+  k: 'call';
+  t: VType;
+  func: VFunc;
+  args: VExpr[];
+  loc?: VSourceLocation;
 }
 
-export type HDLExpr =
-  | HDLVarRef
-  | HDLUnop
-  | HDLBinop
-  | HDLTriop
-  | HDLBlock
-  | HDLVariableDef
-  | HDLFuncCall
-  | HDLConstant;
-
-export interface HDLUnit {
-  files: { [id: string]: HDLFile };
-  dtypes: { [id: string]: HDLDataType };
-  modules: { [id: string]: HDLModuleDef };
-  hierarchies: { [id: string]: HDLHierarchyDef };
+/** System functions ($time, $random...) */
+export interface VSys {
+  k: 'sys';
+  name: string;
+  t: VType;
+  args: VExpr[];
+  loc?: VSourceLocation;
 }
 
-export type HDLValue = number | bigint | Uint8Array | Uint16Array | Uint32Array | HDLValue[];
+export type VExpr = VConst | VVarRef | VOp | VCall | VSys;
+
+export type VStmt =
+  | { s: 'assign'; lhs: VExpr; rhs: VExpr; loc?: VSourceLocation }
+  /** Reset a variable to its power-on value (Verilator CRESET) */
+  | { s: 'creset'; lhs: VExpr; loc?: VSourceLocation }
+  | { s: 'if'; cond: VExpr; then: VStmt[]; else: VStmt[]; loc?: VSourceLocation }
+  /** Infinite loop, exited by 'looptest' (innermost) or 'jumpgo' */
+  | { s: 'loop'; body: VStmt[]; loc?: VSourceLocation }
+  /** Break out of the innermost loop when cond is false */
+  | { s: 'looptest'; cond: VExpr; loc?: VSourceLocation }
+  | { s: 'jumpblock'; id: string; body: VStmt[]; loc?: VSourceLocation }
+  | { s: 'jumpgo'; id: string; loc?: VSourceLocation }
+  | { s: 'return'; value?: VExpr; loc?: VSourceLocation }
+  | { s: 'expr'; e: VExpr; loc?: VSourceLocation }
+  | { s: 'fatal'; msg: string; loc?: VSourceLocation }
+  | { s: 'finish'; loc?: VSourceLocation }
+  | { s: 'stop'; loc?: VSourceLocation };
+
+export interface VFunc {
+  id: string;
+  name: string;
+  args: VVar[];
+  locals: VVar[];
+  body: VStmt[];
+  /** Return type, or null for void functions */
+  ret: VType | null;
+  loc?: VSourceLocation;
+}
+
+export interface VModel {
+  /** Global variables (module state, constant pool, packages) */
+  vars: VVar[];
+  funcs: VFunc[];
+  /** Non fatal issues found while parsing */
+  warnings: string[];
+}

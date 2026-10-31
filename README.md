@@ -17,6 +17,24 @@ npm start
 
 To view the playground, open `http://localhost:5173` in your browser.
 
+### Tests
+
+```bash
+npm test          # unit, integration and torture tests
+npm run typecheck
+```
+
+### Simulator internals
+
+The Verilog code is compiled in the browser by [Verilator](https://github.com/verilator/verilator)
+(itself compiled to WebAssembly), and the model Verilator produces is translated
+to WebAssembly by the playground. See:
+
+- [`src/sim/README.md`](src/sim/README.md): how the simulator works
+- [`verilator/README.md`](verilator/README.md): how to build `verilator_bin.wasm`
+- [`src/sim/torture/README.md`](src/sim/torture/README.md): torture tests against native Verilator,
+  and how to check your own designs (including gate-level netlists)
+
 ## URL Parameters
 
 You can use URL parameters to load a specific preset or a project from GitHub:

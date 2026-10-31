@@ -1,259 +1,1117 @@
+/**
+ * Compiles a Verilated model (VModel, see vjsonparser.ts) into WebAssembly.
+ *
+ * The generated module mirrors the C++ that Verilator emits:
+ *   - all design state lives in linear memory, at fixed addresses
+ *   - every Verilator CFUNC becomes a WASM function
+ *   - the scheduler (_eval, _eval_phase__act, _eval_nba, trigger vectors...)
+ *     is compiled like any other function, so the full Verilator 5 scheduling
+ *     semantics (ico/act/nba regions, derived clocks, convergence loops) are
+ *     preserved
+ *   - values up to 32 bits are i32, up to 64 bits i64, and wider values are
+ *     arrays of 32-bit words in memory handled by the helpers in wasmlib.ts
+ *
+ * The module is generated as WAT text, parsed, validated and optimized by
+ * binaryen, and then instantiated.
+ */
 import binaryen from 'binaryen';
 import {
-  hasDataType,
-  HDLBinop,
-  HDLBlock,
-  HDLConstant,
-  HDLDataType,
   HDLError,
-  HDLExpr,
-  HDLExtendop,
-  HDLFuncCall,
-  HDLLogicType,
-  HDLModuleDef,
   HDLModuleRunner,
-  HDLSourceObject,
-  HDLTriop,
-  HDLUnop,
-  HDLVariableDef,
-  HDLVarRef,
-  HDLWhileOp,
-  isArrayItem,
-  isArrayType,
-  isBigConstExpr,
-  isBinop,
-  isBlock,
-  isConstExpr,
-  isFuncCall,
-  isLogicType,
-  isTriop,
-  isUnop,
-  isVarDecl,
-  isVarRef,
-  isWhileop,
+  isArray,
+  isLogic,
+  isWide,
+  numWords,
+  typeAlign,
+  typeSize,
+  VExpr,
+  VFunc,
+  VInit,
+  VLogicType,
+  VModel,
+  VStmt,
+  VType,
+  VVar,
 } from './hdltypes';
+import { helperScratchSize, wasmHelpers } from './wasmlib';
 
-const VERILATOR_UNIT_FUNCTIONS = [
-  '_ctor_var_reset',
-  '_eval_initial',
-  '_eval_settle',
-  '_eval',
-  '_eval_phase__stl',
-  '_eval_static',
-];
-
-interface Options {
-  store?: boolean;
-  funcblock?: HDLBlock;
-  funcarg?: boolean;
-  resulttype?: number;
-}
-
-const GLOBALOFS = 0;
-const MEMORY = '$$MEM';
-const GLOBAL = '$$GLOBAL';
-const CHANGEDET = '$$CHANGE';
 const TRACERECLEN = '$$treclen';
 const TRACEOFS = '$$tofs';
 const TRACEEND = '$$tend';
 const TRACEBUF = '$$tbuf';
+const DIDINIT = '$$didinit';
 
-///
+/** Numeric class of a value in WASM */
+type Cls = 'i32' | 'i64';
 
-function getDataTypeSize(dt: HDLDataType): number {
-  if (isLogicType(dt)) {
-    if (dt.left <= 7) return 1;
-    else if (dt.left <= 15) return 2;
-    else if (dt.left <= 31) return 4;
-    else if (dt.left <= 63) return 8;
-    else return (dt.left >> 6) * 8 + 8; // 64-bit words
-  } else if (isArrayType(dt)) {
-    // TODO: additional padding for array?
-    return (Math.abs(dt.high.cvalue - dt.low.cvalue) + 1) * getDataTypeSize(dt.subtype);
-  } else if (dt.jstype == 'string') {
-    return 0; // TODO?
-  } else {
-    throw new HDLError(dt, `don't know data type`);
+function clsOf(t: VType): Cls {
+  if (isLogic(t)) {
+    if (t.width <= 32) return 'i32';
+    if (t.width <= 64) return 'i64';
   }
+  throw new HDLError(t, `type ${describeType(t)} is not a scalar`);
 }
 
-function isReferenceType(dt: HDLDataType): boolean {
-  return getDataTypeSize(dt) > 8;
+function bitsOf(c: Cls) {
+  return c === 'i32' ? 32 : 64;
 }
 
-function getArrayElementSizeFromType(dtype: HDLDataType): number {
-  if (isArrayType(dtype)) {
-    return getArrayElementSizeFromType(dtype.subtype);
-  } else {
-    return getDataTypeSize(dtype);
-  }
+function describeType(t: VType): string {
+  if (isLogic(t)) return `logic[${t.width}]${t.signed ? ' signed' : ''}`;
+  if (isArray(t)) return `${describeType(t.elem)}[${t.count}]`;
+  return t.name;
 }
 
-function getArrayElementSizeFromExpr(e: HDLExpr): number {
-  if (hasDataType(e) && isArrayType(e.dtype)) {
-    return getDataTypeSize(e.dtype.subtype);
-  } else if (hasDataType(e) && isLogicType(e.dtype) && e.dtype.left > 63) {
-    throw new HDLError(e, `elements > 64 bits not supported`);
-  }
-  throw new HDLError(e, `cannot figure out array element size`);
+function isScalar(t: VType) {
+  return isLogic(t) && t.width <= 64;
 }
 
-function getArrayValueSize(e: HDLExpr): number {
-  return getDataTypeSize(getArrayValueType(e));
+function i32c(n: number | bigint) {
+  return `(i32.const ${Number(BigInt.asIntN(32, BigInt(n)))})`;
 }
 
-function getArrayValueType(e: HDLExpr): HDLDataType {
-  if (isVarRef(e)) {
-    var dt = e.dtype;
-    while (isArrayType(dt)) dt = dt.subtype;
-    return dt;
-  } else if (isBinop(e) && e.op == 'arraysel') {
-    return getArrayValueType(e.left);
-  } else if (isBinop(e) && e.op == 'wordsel') {
-    return getArrayValueType(e.left);
-  }
-  throw new HDLError(e, `cannot figure out array value type`);
+function i64c(n: number | bigint) {
+  return `(i64.const ${BigInt.asIntN(64, BigInt(n)).toString()})`;
 }
 
-function getAlignmentForSize(size: number) {
-  if (size <= 1) return 1;
-  else if (size <= 2) return 2;
-  else if (size <= 4) return 4;
-  else return 8;
+function constOf(c: Cls, n: number | bigint) {
+  return c === 'i32' ? i32c(n) : i64c(n);
 }
 
-function getBinaryenType(size: number) {
-  if (size <= 4) return binaryen.i32;
-  else if (size <= 8) return binaryen.i64;
-  else return binaryen.none;
+function coerce(code: string, from: Cls, to: Cls) {
+  if (from === to) return code;
+  if (from === 'i32') return `(i64.extend_i32_u ${code})`;
+  return `(i32.wrap_i64 ${code})`;
 }
 
-/**
- * Check if a data type is wider than 64 bits
- */
-function isWideType(dt: HDLDataType): boolean {
-  if (isLogicType(dt)) return dt.left > 63;
-  if (isArrayType(dt)) {
-    return getDataTypeSize(dt) > 8;
-  }
-  return false; // everything else is not
+function maskBits(width: number): bigint {
+  return (1n << BigInt(width)) - 1n;
 }
 
-/**
- * Get the number of 32-bit chunks needed for a data type
- */
-function getNumChunks(dt: HDLDataType): number {
-  if (isLogicType(dt)) {
-    return Math.ceil((dt.left + 1) / 32);
-  }
-  if (isArrayType(dt)) {
-    return Math.ceil(getDataTypeSize(dt) / 4);
-  }
-  throw new HDLError(dt, `cannot get chunk count for non-logic type`);
-}
-
-/**
- * Bit mask with the low `bits` bits set, as a signed i32 literal suitable for
- * `binaryen.i32.const`. `bits` must be in 1..31 (for 0 no mask is needed and
- * for 32 the full chunk passes through unchanged).
- */
-function maskLowBits(bits: number): number {
-  return (-1 >>> (32 - bits)) | 0;
-}
-
-interface StructRec {
+export interface StructRec {
   name: string;
-  type: HDLDataType | undefined;
   offset: number;
   size: number;
-  itype: number | undefined;
-  index: number;
-  init: HDLBlock | null | undefined;
-  constval: HDLConstant | null | undefined;
-  reset: boolean;
+  type?: VType;
+  v?: VVar;
 }
 
+/** Layout of the data segment */
 class Struct {
-  parent!: Struct;
-  len: number = 0;
-  vars: { [name: string]: StructRec } = {};
-  locals: StructRec[] = [];
-  params: StructRec[] = [];
+  len = 0;
+  vars: Record<string, StructRec> = {};
 
-  addVar(vardef: HDLVariableDef) {
-    var size = getDataTypeSize(vardef.dtype);
-    var rec = this.addEntry(vardef.name, size, getBinaryenType(size), vardef.dtype, false);
-    rec.init = vardef.initValue;
-    rec.constval = vardef.constValue;
-    return rec;
-  }
-
-  alignTo(align: number): void {
+  alignTo(align: number) {
     while (this.len % align) this.len++;
   }
 
-  addEntry(
-    name: string,
-    size: number,
-    itype?: number,
-    hdltype?: HDLDataType,
-    isParam?: boolean,
-  ): StructRec {
-    this.alignTo(getAlignmentForSize(size));
-    // pointers are 32 bits, so if size > 8 it's a pointer
-    var rec: StructRec = {
-      name: name,
-      type: hdltype,
-      size: size,
-      itype: itype,
-      index: this.params.length + this.locals.length,
-      offset: isParam ? this.params.length : this.len,
-      init: null,
-      constval: null,
-      reset: false,
-    };
+  alloc(size: number, align: number) {
+    this.alignTo(Math.max(1, align));
+    const offset = this.len;
     this.len += size;
-    if (rec.name != null) this.vars[rec.name] = rec;
-    if (isParam) this.params.push(rec);
-    else this.locals.push(rec);
-    return rec;
+    return offset;
   }
 
-  getLocals(): number[] {
-    var vars: number[] = [];
-    for (const rec of this.locals) {
-      vars.push(rec.itype!);
-    }
-    return vars;
+  addEntry(name: string, size: number, type?: VType, v?: VVar): StructRec {
+    const offset = this.alloc(size, type ? typeAlign(type) : Math.min(size, 8));
+    const rec: StructRec = { name, offset, size, type, v };
+    this.vars[name] = rec;
+    return rec;
   }
 
   lookup(name: string): StructRec {
     return this.vars[name];
   }
+}
 
-  lookparam(name: string): StructRec {
-    return this.params.filter((x) => x.name == name)[0];
+interface Options {
+  maxMemoryMB?: number;
+  /** run the binaryen optimizer (default: true) */
+  optimize?: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Code generator
+// ---------------------------------------------------------------------------
+
+interface FuncCtx {
+  f: VFunc;
+  locals: string[]; // extra local declarations
+  tmpCount: number;
+  labelCount: number;
+  loopLabels: string[]; // innermost last
+  /** memory-resident locals (wide, arrays, or passed by reference) */
+  memLocals: Map<string, number>;
+}
+
+class WatGen {
+  globals = new Struct();
+  /** address of each memory-resident variable, by var id */
+  varAddr = new Map<string, number>();
+  /** initialized data: [offset, bytes] */
+  data: [number, Uint8Array][] = [];
+  wideConsts = new Map<string, number>();
+  funcNames = new Map<string, string>();
+  fatalMessages: string[] = [];
+  maxWords = 2;
+  outputbytes = 0;
+  statebytes = 0;
+  traceBufferSize: number;
+
+  private ctx!: FuncCtx;
+  private out: string[] = [];
+
+  constructor(
+    public model: VModel,
+    traceBufferSize: number,
+  ) {
+    this.traceBufferSize = traceBufferSize;
+  }
+
+  generate(): string {
+    this.layout();
+    const funcs: string[] = [];
+    for (const f of this.model.funcs) funcs.push(this.genFunc(f));
+    // scratch area for the wide helpers, sized after code generation since
+    // temporaries may be wider than any variable
+    this.globals.alignTo(8);
+    const scratch = this.globals.alloc(helperScratchSize(this.maxWords), 8);
+    const helpers = wasmHelpers(scratch, this.maxWords);
+    const membytes = this.globals.len;
+    const pages = Math.ceil(membytes / 65536) + 1;
+    const lines: string[] = [];
+    lines.push('(module');
+    lines.push('  (import "builtins" "finish" (func $__finish (param i32)))');
+    lines.push('  (import "builtins" "stop" (func $__stop (param i32)))');
+    lines.push('  (import "builtins" "fatal" (func $__fatal (param i32)))');
+    lines.push('  (import "builtins" "time" (func $__time (result i64)))');
+    lines.push('  (import "builtins" "random" (func $__random (result i32)))');
+    lines.push(`  (memory $mem ${pages} ${pages})`);
+    lines.push('  (export "memory" (memory $mem))');
+    lines.push(helpers);
+    lines.push(...funcs);
+    lines.push(this.genDriver());
+    for (const [offset, bytes] of this.data) {
+      lines.push(`  (data (i32.const ${offset}) "${escapeBytes(bytes)}")`);
+    }
+    lines.push(')');
+    return lines.join('\n');
+  }
+
+  // --- memory layout ---
+
+  private layout() {
+    const g = this.globals;
+    const vars = this.model.vars;
+    const sortKey = (v: VVar) => typeSize(v.type);
+    for (const f of this.model.funcs) this.funcNames.set(f.id, f.name);
+    // outputs first (contiguous, copied to the trace buffer)
+    const outputs = vars
+      .filter((v) => v.isPrimaryIO && v.dir === 'output' && !v.isConst)
+      .sort((a, b) => sortKey(a) - sortKey(b));
+    for (const v of outputs) this.addGlobal(v);
+    if (g.len === 0) g.addEntry('___', 1);
+    g.alignTo(8);
+    this.outputbytes = g.len;
+    // inputs and internal state
+    const outSet = new Set(outputs);
+    const state = vars.filter((v) => !outSet.has(v) && !v.isConst);
+    state.sort((a, b) => sortKey(a) - sortKey(b));
+    for (const v of state) this.addGlobal(v);
+    g.addEntry(DIDINIT, 4);
+    g.alignTo(8);
+    this.statebytes = g.len;
+    // constants (initialized by data segments, never cleared)
+    for (const v of vars.filter((v) => v.isConst)) {
+      const rec = this.addGlobal(v);
+      if (v.init) this.data.push([rec.offset, this.initBytes(v.type, v.init)]);
+    }
+    // function locals that must live in memory
+    for (const f of this.model.funcs) {
+      const forceMem = new Set<string>();
+      collectByRefArgs(f.body, forceMem);
+      for (const v of f.locals) {
+        if (!isScalar(v.type) || forceMem.has(v.id)) {
+          const offset = g.alloc(Math.max(typeSize(v.type), 1), typeAlign(v.type));
+          this.varAddr.set(v.id, offset);
+        }
+      }
+    }
+    for (const v of [...vars, ...this.model.funcs.flatMap((f) => [...f.args, ...f.locals])]) {
+      if (isWide(v.type)) this.maxWords = Math.max(this.maxWords, numWords(v.type as VLogicType));
+      if (isArray(v.type) && isWide(v.type.elem)) {
+        this.maxWords = Math.max(this.maxWords, numWords(v.type.elem as VLogicType));
+      }
+    }
+    // trace buffer
+    g.alignTo(8);
+    g.addEntry(TRACERECLEN, 4);
+    g.addEntry(TRACEOFS, 4);
+    g.addEntry(TRACEEND, 4);
+    g.alignTo(8);
+    g.addEntry(TRACEBUF, this.traceBufferSize);
+    // the code generator allocates wide temporaries after this point
+  }
+
+  private addGlobal(v: VVar) {
+    const size = Math.max(typeSize(v.type), 1);
+    const rec = this.globals.addEntry(v.name, size, v.type, v);
+    this.varAddr.set(v.id, rec.offset);
+    return rec;
+  }
+
+  private initBytes(t: VType, init: VInit): Uint8Array {
+    const bytes = new Uint8Array(typeSize(t));
+    const write = (tt: VType, ini: VInit | undefined, base: number) => {
+      if (!ini) return;
+      if (isArray(tt)) {
+        const es = typeSize(tt.elem);
+        for (let i = 0; i < tt.count; i++) {
+          const item = ini.kind === 'array' ? ini.items.get(i) ?? ini.dflt : ini;
+          write(tt.elem, item, base + i * es);
+        }
+      } else if (isLogic(tt) && ini.kind === 'const') {
+        let value = ini.value & maskBits(Math.max(typeSize(tt) * 8, 8));
+        for (let i = 0; i < typeSize(tt); i++) {
+          bytes[base + i] = Number(value & 0xffn);
+          value >>= 8n;
+        }
+      }
+    };
+    write(t, init, 0);
+    return bytes;
+  }
+
+  /** allocate a temporary for a wide value (static, never recursive) */
+  private allocWide(words: number) {
+    this.maxWords = Math.max(this.maxWords, words);
+    return this.globals.alloc(words * 4, 8);
+  }
+
+  private wideConst(value: bigint, words: number) {
+    const key = `${words}:${value.toString(16)}`;
+    let addr = this.wideConsts.get(key);
+    if (addr === undefined) {
+      addr = this.allocWide(words);
+      const bytes = new Uint8Array(words * 4);
+      let v = value;
+      for (let i = 0; i < bytes.length; i++) {
+        bytes[i] = Number(v & 0xffn);
+        v >>= 8n;
+      }
+      this.data.push([addr, bytes]);
+      this.wideConsts.set(key, addr);
+    }
+    return addr;
+  }
+
+  // --- functions ---
+
+  private genFunc(f: VFunc): string {
+    this.ctx = {
+      f,
+      locals: [],
+      tmpCount: 0,
+      labelCount: 0,
+      loopLabels: [],
+      memLocals: new Map(),
+    };
+    const params: string[] = [];
+    for (const a of f.args) {
+      if (a.byRef || !isScalar(a.type)) params.push(`(param ${this.localName(a)} i32)`);
+      else params.push(`(param ${this.localName(a)} ${clsOf(a.type)})`);
+    }
+    for (const v of f.locals) {
+      if (this.varAddr.has(v.id)) continue; // in memory
+      this.ctx.locals.push(`(local ${this.localName(v)} ${clsOf(v.type)})`);
+    }
+    const result = f.ret ? `(result ${clsOf(f.ret)})` : '';
+    const body = this.stmts(f.body);
+    const tail = f.ret ? '\n    (unreachable)' : '';
+    return `  (func $${f.name} ${params.join(' ')} ${result}\n    ${this.ctx.locals.join(' ')}\n    ${body}${tail})`;
+  }
+
+  private localName(v: VVar) {
+    return `$v_${v.id.replace(/[^a-zA-Z0-9_]/g, '')}`;
+  }
+
+  private tmp(cls: Cls) {
+    const name = `$t${this.ctx.tmpCount++}`;
+    this.ctx.locals.push(`(local ${name} ${cls})`);
+    return name;
+  }
+
+  private label(prefix: string) {
+    return `$${prefix}${this.ctx.labelCount++}`;
+  }
+
+  // --- statements ---
+
+  private stmts(list: VStmt[]): string {
+    return list.map((s) => this.stmt(s)).join('\n    ');
+  }
+
+  private stmt(s: VStmt): string {
+    switch (s.s) {
+      case 'assign':
+        return this.assign(s.lhs, s.rhs);
+      case 'creset':
+        return this.creset(s.lhs);
+      case 'if': {
+        const els = s.else.length ? ` (else ${this.stmts(s.else)})` : '';
+        return `(if ${this.cond(s.cond)} (then ${this.stmts(s.then)})${els})`;
+      }
+      case 'loop': {
+        const brk = this.label('brk');
+        const cont = this.label('cont');
+        this.ctx.loopLabels.push(brk);
+        const body = this.stmts(s.body);
+        this.ctx.loopLabels.pop();
+        return `(block ${brk} (loop ${cont} ${body} (br ${cont})))`;
+      }
+      case 'looptest': {
+        const brk = this.ctx.loopLabels[this.ctx.loopLabels.length - 1];
+        if (!brk) throw new HDLError(s, 'LOOPTEST outside of a loop');
+        return `(br_if ${brk} (i32.eqz ${this.cond(s.cond)}))`;
+      }
+      case 'jumpblock':
+        return `(block $jb_${s.id.replace(/[^a-zA-Z0-9_]/g, '')} ${this.stmts(s.body)})`;
+      case 'jumpgo':
+        return `(br $jb_${s.id.replace(/[^a-zA-Z0-9_]/g, '')})`;
+      case 'return': {
+        const f = this.ctx.f;
+        if (!s.value || !f.ret) return '(return)';
+        return `(return ${this.exAs(s.value, clsOf(f.ret))})`;
+      }
+      case 'expr': {
+        const e = s.e;
+        if (e.k === 'call') {
+          const code = this.call(e);
+          return e.func.ret ? `(drop ${code})` : code;
+        }
+        if (isScalar(e.t)) return `(drop ${this.ex(e)})`;
+        return '(nop)';
+      }
+      case 'fatal': {
+        this.fatalMessages.push(s.msg + (s.loc ? ` (line ${s.loc.line})` : ''));
+        return `(call $__fatal ${i32c(this.fatalMessages.length - 1)}) (unreachable)`;
+      }
+      case 'finish':
+        return `(call $__finish ${i32c(s.loc?.line ?? 0)})`;
+      case 'stop':
+        return `(call $__stop ${i32c(s.loc?.line ?? 0)})`;
+    }
+  }
+
+  /** i32 boolean for a condition */
+  private cond(e: VExpr): string {
+    if (isWide(e.t))
+      return `(call $w_redor ${this.wideAddr(e)} ${i32c(numWords(e.t as VLogicType))})`;
+    const c = clsOf(e.t);
+    const code = this.ex(e);
+    return c === 'i32' ? code : `(i64.ne ${code} (i64.const 0))`;
+  }
+
+  private assign(lhs: VExpr, rhs: VExpr): string {
+    const t = lhs.t;
+    if (isArray(t)) {
+      return `(memory.copy ${this.lvAddr(lhs)} ${this.addrOf(rhs)} ${i32c(typeSize(t))})`;
+    }
+    if (isWide(t)) {
+      const words = numWords(t as VLogicType);
+      const dst = this.lvAddr(lhs);
+      // compute directly into the destination when it can't alias the sources
+      if (rhs.k === 'op' && lhs.k === 'var' && !exprUsesVar(rhs, lhs.v)) {
+        return this.wideInto(rhs, dst, words);
+      }
+      return `(call $w_copy ${dst} ${this.wideAddr(rhs)} ${i32c(words)})`;
+    }
+    const cls = clsOf(t);
+    let value = this.exAs(rhs, cls);
+    if (lhs.k === 'var' && !this.isMemVar(lhs.v)) {
+      // emulate C storage truncation for CData/SData locals
+      const size = typeSize(t);
+      if (size < 4) value = `(i32.and ${value} ${i32c(size === 1 ? 0xff : 0xffff)})`;
+      return `(local.set ${this.localName(lhs.v)} ${value})`;
+    }
+    return this.store(this.lvAddr(lhs), typeSize(t), cls, value);
+  }
+
+  private creset(lhs: VExpr): string {
+    const t = lhs.t;
+    if (isArray(t) || isWide(t)) {
+      return `(memory.fill ${this.lvAddr(lhs)} (i32.const 0) ${i32c(typeSize(t))})`;
+    }
+    if (!isScalar(t)) return '(nop)';
+    const cls = clsOf(t);
+    if (lhs.k === 'var' && !this.isMemVar(lhs.v)) {
+      return `(local.set ${this.localName(lhs.v)} ${constOf(cls, 0)})`;
+    }
+    return this.store(this.lvAddr(lhs), typeSize(t), cls, constOf(cls, 0));
+  }
+
+  private store(addr: string, size: number, cls: Cls, value: string) {
+    switch (size) {
+      case 1:
+        return `(i32.store8 ${addr} ${value})`;
+      case 2:
+        return `(i32.store16 ${addr} ${value})`;
+      case 4:
+        return `(i32.store ${addr} ${value})`;
+      case 8:
+        return `(i64.store ${addr} ${value})`;
+    }
+    throw new Error(`bad store size ${size} (${cls})`);
+  }
+
+  private load(addr: string, t: VType) {
+    switch (typeSize(t)) {
+      case 1:
+        return `(i32.load8_u ${addr})`;
+      case 2:
+        return `(i32.load16_u ${addr})`;
+      case 4:
+        return `(i32.load ${addr})`;
+      case 8:
+        return `(i64.load ${addr})`;
+    }
+    throw new HDLError(t, `cannot load ${describeType(t)}`);
+  }
+
+  // --- variables and addresses ---
+
+  private isMemVar(v: VVar) {
+    if (v.scope === 'arg') return v.byRef || !isScalar(v.type);
+    return this.varAddr.has(v.id);
+  }
+
+  private varAddrCode(v: VVar): string {
+    if (v.scope === 'arg') {
+      if (!this.isMemVar(v)) throw new HDLError(v, `argument ${v.name} has no address`);
+      return `(local.get ${this.localName(v)})`;
+    }
+    const addr = this.varAddr.get(v.id);
+    if (addr === undefined) throw new HDLError(v, `variable ${v.name} has no address`);
+    return i32c(addr);
+  }
+
+  /** Address of an lvalue (variable, array element, word of a wide value) */
+  private lvAddr(e: VExpr): string {
+    if (e.k === 'var') return this.varAddrCode(e.v);
+    if (e.k === 'op' && e.op === 'arraysel') {
+      const [from, idx] = e.args;
+      if (!isArray(from.t)) throw new HDLError(e, `ARRAYSEL on non-array ${describeType(from.t)}`);
+      const es = typeSize(from.t.elem);
+      return this.indexAddr(this.lvAddr(from), idx, es);
+    }
+    if (e.k === 'op' && e.op === 'wordsel') {
+      const [from, idx] = e.args;
+      return this.indexAddr(this.wideAddr(from), idx, 4);
+    }
+    throw new HDLError(e, `cannot take the address of ${e.k === 'op' ? e.op : e.k}`);
+  }
+
+  private indexAddr(base: string, idx: VExpr, elsize: number) {
+    if (idx.k === 'const') {
+      const off = Number(idx.value) * elsize;
+      return off ? `(i32.add ${base} ${i32c(off)})` : base;
+    }
+    return `(i32.add ${base} (i32.mul ${this.exAs(idx, 'i32')} ${i32c(elsize)}))`;
+  }
+
+  /** Address of any value that lives (or can be materialized) in memory */
+  private addrOf(e: VExpr): string {
+    if (e.k === 'var' || (e.k === 'op' && (e.op === 'arraysel' || e.op === 'wordsel'))) {
+      if (e.k !== 'var' || this.isMemVar(e.v)) return this.lvAddr(e);
+    }
+    if (isWide(e.t)) return this.wideAddr(e);
+    if (isScalar(e.t)) {
+      // materialize a scalar into a temporary memory slot
+      const size = typeSize(e.t);
+      const addr = this.globals.alloc(size, size);
+      return `(block (result i32) ${this.store(i32c(addr), size, clsOf(e.t), this.ex(e))} ${i32c(addr)})`;
+    }
+    throw new HDLError(e, `cannot take the address of ${describeType(e.t)}`);
+  }
+
+  // --- scalar expressions ---
+
+  /** evaluate e in its natural class */
+  private ex(e: VExpr): string {
+    if (!isScalar(e.t)) {
+      throw new HDLError(e, `expected a scalar value, got ${describeType(e.t)}`);
+    }
+    return this.exAs(e, clsOf(e.t));
+  }
+
+  /** evaluate e (scalar or wide) as cls (wide values are truncated) */
+  private exAs(e: VExpr, cls: Cls): string {
+    if (isWide(e.t)) {
+      const addr = this.wideAddr(e);
+      return cls === 'i32' ? `(i32.load ${addr})` : `(i64.load ${addr})`;
+    }
+    if (!isScalar(e.t)) throw new HDLError(e, `expected a scalar value, got ${describeType(e.t)}`);
+    const nat = clsOf(e.t);
+    return coerce(this.exNat(e), nat, cls);
+  }
+
+  private exNat(e: VExpr): string {
+    const cls = clsOf(e.t);
+    switch (e.k) {
+      case 'const':
+        return constOf(cls, e.value);
+      case 'var':
+        if (this.isMemVar(e.v)) return this.load(this.varAddrCode(e.v), e.v.type);
+        return `(local.get ${this.localName(e.v)})`;
+      case 'call':
+        return this.coerceCall(e, cls);
+      case 'sys':
+        if (e.name === '$time') return coerce('(call $__time)', 'i64', cls);
+        if (e.name === '$random') return coerce('(call $__random)', 'i32', cls);
+        throw new HDLError(e, `unsupported system function ${e.name}`);
+      case 'op':
+        return this.op(e.op, e.args, e.t as VLogicType, e);
+    }
+  }
+
+  private coerceCall(e: VExpr & { k: 'call' }, cls: Cls) {
+    if (!e.func.ret) throw new HDLError(e, `function ${e.func.name} returns no value`);
+    return coerce(this.call(e), clsOf(e.func.ret), cls);
+  }
+
+  private call(e: VExpr & { k: 'call' }): string {
+    const f = e.func;
+    const args = f.args.map((p, i) => {
+      const a = e.args[i];
+      if (!a) throw new HDLError(e, `missing argument ${p.name} calling ${f.name}`);
+      if (p.byRef || !isScalar(p.type)) return this.addrOf(a);
+      return this.exAs(a, clsOf(p.type));
+    });
+    return `(call $${f.name} ${args.join(' ')})`;
+  }
+
+  private op(op: string, args: VExpr[], t: VLogicType, e: VExpr): string {
+    const cls = clsOf(t);
+    const I = cls; // instruction prefix
+    const [a, b] = args;
+    const bin = (inst: string) => `(${I}.${inst} ${this.exAs(a, cls)} ${this.exAs(b, cls)})`;
+    switch (op) {
+      case 'add':
+        return bin('add');
+      case 'sub':
+        return bin('sub');
+      case 'mul':
+        return bin('mul');
+      case 'and':
+        return bin('and');
+      case 'or':
+        return bin('or');
+      case 'xor':
+        return bin('xor');
+      case 'div':
+        return `(call $divu${bitsOf(cls)} ${this.exAs(a, cls)} ${this.exAs(b, cls)})`;
+      case 'moddiv':
+        return `(call $remu${bitsOf(cls)} ${this.exAs(a, cls)} ${this.exAs(b, cls)})`;
+      case 'divs':
+      case 'moddivs':
+      case 'muls': {
+        const lbits = widthMinOf(a);
+        const sa = this.sext(this.exAs(a, cls), cls, lbits);
+        const sb = this.sext(this.exAs(b, cls), cls, lbits);
+        if (op === 'muls') return `(${I}.mul ${sa} ${sb})`;
+        return `(call $${op === 'divs' ? 'divs' : 'rems'}${bitsOf(cls)} ${sa} ${sb})`;
+      }
+      case 'pow':
+        return `(call $powu${bitsOf(cls)} ${this.exAs(a, cls)} ${this.exAs(b, cls)})`;
+      case 'not':
+        return `(${I}.xor ${this.exAs(a, cls)} ${constOf(cls, -1)})`;
+      case 'negate':
+        return `(${I}.sub ${constOf(cls, 0)} ${this.exAs(a, cls)})`;
+      case 'ccast':
+      case 'extend':
+        return this.exAs(a, cls);
+      case 'extends': {
+        if (isWide(a.t)) return this.exAs(a, cls);
+        return this.sext(this.exAs(a, cls), cls, widthMinOf(a));
+      }
+      case 'lognot':
+        return coerce(`(i32.eqz ${this.cond(a)})`, 'i32', cls);
+      case 'logand':
+        return coerce(
+          `(i32.and (i32.ne ${this.cond(a)} (i32.const 0)) (i32.ne ${this.cond(b)} (i32.const 0)))`,
+          'i32',
+          cls,
+        );
+      case 'logor':
+        return coerce(
+          `(i32.or (i32.ne ${this.cond(a)} (i32.const 0)) (i32.ne ${this.cond(b)} (i32.const 0)))`,
+          'i32',
+          cls,
+        );
+      case 'logif':
+        return coerce(
+          `(i32.or (i32.eqz ${this.cond(a)}) (i32.ne ${this.cond(b)} (i32.const 0)))`,
+          'i32',
+          cls,
+        );
+      case 'logeq':
+        return coerce(
+          `(i32.eq (i32.ne ${this.cond(a)} (i32.const 0)) (i32.ne ${this.cond(b)} (i32.const 0)))`,
+          'i32',
+          cls,
+        );
+      case 'redor':
+        return coerce(`(i32.ne ${this.cond(a)} (i32.const 0))`, 'i32', cls);
+      case 'redxor': {
+        if (isWide(a.t)) {
+          return coerce(
+            `(call $w_redxor ${this.wideAddr(a)} ${i32c(numWords(a.t as VLogicType))})`,
+            'i32',
+            cls,
+          );
+        }
+        const ac = clsOf(a.t);
+        return coerce(`(${ac}.and (${ac}.popcnt ${this.ex(a)}) ${constOf(ac, 1)})`, ac, cls);
+      }
+      case 'redand': {
+        const w = (a.t as VLogicType).width;
+        if (isWide(a.t))
+          return coerce(`(call $w_redand ${this.wideAddr(a)} ${i32c(w)})`, 'i32', cls);
+        const ac = clsOf(a.t);
+        const m = constOf(ac, maskBits(w));
+        return coerce(`(${ac}.eq (${ac}.and ${this.ex(a)} ${m}) ${m})`, 'i32', cls);
+      }
+      case 'countones': {
+        if (isWide(a.t))
+          return coerce(
+            `(call $w_popcnt ${this.wideAddr(a)} ${i32c(numWords(a.t as VLogicType))})`,
+            'i32',
+            cls,
+          );
+        const ac = clsOf(a.t);
+        return coerce(`(${ac}.popcnt ${this.ex(a)})`, ac, cls);
+      }
+      case 'onehot':
+      case 'onehot0': {
+        const ac = isWide(a.t) ? null : clsOf(a.t);
+        if (!ac) throw new HDLError(e, `${op} on wide values is not supported`);
+        const cmp = op === 'onehot' ? 'eq' : 'le_u';
+        return coerce(`(${ac}.${cmp} (${ac}.popcnt ${this.ex(a)}) ${constOf(ac, 1)})`, 'i32', cls);
+      }
+      case 'eq':
+      case 'neq':
+      case 'eqcase':
+      case 'neqcase':
+      case 'lt':
+      case 'lte':
+      case 'gt':
+      case 'gte':
+        return coerce(this.compare(op.replace('case', ''), a, b, false), 'i32', cls);
+      case 'lts':
+      case 'ltes':
+      case 'gts':
+      case 'gtes':
+        return coerce(this.compare(op.slice(0, -1), a, b, true), 'i32', cls);
+      case 'shiftl':
+      case 'shiftlovr':
+      case 'shiftr':
+      case 'shiftrovr': {
+        // operate in the wider of the operand and result classes
+        const lc = isWide(a.t) ? 'i64' : clsOf(a.t);
+        const oc: Cls = lc === 'i64' || cls === 'i64' ? 'i64' : 'i32';
+        const dir = op.startsWith('shiftl') ? 'shl' : 'shr';
+        if (b.k === 'const' && b.value < BigInt(bitsOf(oc))) {
+          const inst = dir === 'shl' ? 'shl' : 'shr_u';
+          return coerce(`(${oc}.${inst} ${this.exAs(a, oc)} ${constOf(oc, b.value)})`, oc, cls);
+        }
+        return coerce(`(call $${dir}${bitsOf(oc)} ${this.exAs(a, oc)} ${this.shamt(b)})`, oc, cls);
+      }
+      case 'shiftrs':
+      case 'shiftrsovr': {
+        const lc = isWide(a.t) ? 'i64' : clsOf(a.t);
+        const oc: Cls = lc === 'i64' || cls === 'i64' ? 'i64' : 'i32';
+        const lbits = widthMinOf(a);
+        return coerce(
+          `(call $shrs${bitsOf(oc)} ${this.exAs(a, oc)} ${this.shamt(b)} ${i32c(t.widthMin)} ${i32c(lbits)})`,
+          oc,
+          cls,
+        );
+      }
+      case 'cond': {
+        const [c, x, y] = args;
+        return `(if (result ${cls}) ${this.cond(c)} (then ${this.exAs(x, cls)}) (else ${this.exAs(y, cls)}))`;
+      }
+      case 'arraysel': {
+        const from = args[0];
+        if (!isArray(from.t)) throw new HDLError(e, `ARRAYSEL on ${describeType(from.t)}`);
+        return coerce(this.load(this.lvAddr(e), from.t.elem), clsOf(from.t.elem), cls);
+      }
+      case 'wordsel':
+        return coerce(`(i32.load ${this.lvAddr(e)})`, 'i32', cls);
+      case 'sel': {
+        const [from, lsb] = args;
+        const width = t.width;
+        if (isWide(from.t)) {
+          const bits = `(call $w_getbits ${this.wideAddr(from)} ${i32c(numWords(from.t as VLogicType))} ${this.exAs(lsb, 'i32')})`;
+          return `(${cls}.and ${coerce(bits, 'i64', cls)} ${constOf(cls, maskBits(width))})`;
+        }
+        const fc = clsOf(from.t);
+        const shifted = `(call $shr${bitsOf(fc)} ${this.ex(from)} ${this.exAs(lsb, 'i32')})`;
+        return `(${cls}.and ${coerce(shifted, fc, cls)} ${constOf(cls, maskBits(width))})`;
+      }
+      case 'concat': {
+        const rw = (b.t as VLogicType).width;
+        if (rw >= bitsOf(cls)) return this.exAs(b, cls);
+        return `(${I}.or (${I}.shl ${this.exAs(a, cls)} ${constOf(cls, rw)}) ${this.exAs(b, cls)})`;
+      }
+      case 'replicate': {
+        const sw = (a.t as VLogicType).width;
+        if (b.k !== 'const') throw new HDLError(e, 'replication count must be constant');
+        const n = Number(b.value);
+        if (n <= 0) return constOf(cls, 0);
+        const src = this.tmp(cls);
+        let acc = `(local.tee ${src} ${this.exAs(a, cls)})`;
+        for (let i = 1; i < n; i++) {
+          acc = `(${I}.or (${I}.shl ${acc} ${constOf(cls, sw)}) (local.get ${src}))`;
+        }
+        return acc;
+      }
+      default:
+        throw new HDLError(e, `unsupported operation ${op} on ${describeType(t)}`);
+    }
+  }
+
+  /** sign extend a value of class cls from lbits (VL_EXTENDS) */
+  private sext(code: string, cls: Cls, lbits: number) {
+    if (lbits >= bitsOf(cls)) return code;
+    return `(call $sext${bitsOf(cls)} ${code} ${i32c(lbits)})`;
+  }
+
+  /** shift amount as an unsigned i32 (huge amounts saturate) */
+  private shamt(e: VExpr): string {
+    if (isWide(e.t))
+      return `(call $w_shamt ${this.wideAddr(e)} ${i32c(numWords(e.t as VLogicType))})`;
+    if (clsOf(e.t) === 'i64') return `(call $sat64 ${this.ex(e)})`;
+    return this.ex(e);
+  }
+
+  private compare(op: string, a: VExpr, b: VExpr, signed: boolean): string {
+    if (isWide(a.t) || isWide(b.t)) {
+      const words = Math.max(wordsOf(a.t), wordsOf(b.t));
+      const pa = this.wideAddrN(a, words);
+      const pb = this.wideAddrN(b, words);
+      if (op === 'eq') return `(call $w_eq ${pa} ${pb} ${i32c(words)})`;
+      if (op === 'neq') return `(i32.eqz (call $w_eq ${pa} ${pb} ${i32c(words)}))`;
+      const cmp = signed
+        ? `(call $w_cmps ${pa} ${pb} ${i32c(widthMinOf(a))})`
+        : `(call $w_cmp ${pa} ${pb} ${i32c(words)})`;
+      const rel = { lt: 'lt_s', lte: 'le_s', gt: 'gt_s', gte: 'ge_s' }[op as 'lt'];
+      return `(i32.${rel} ${cmp} (i32.const 0))`;
+    }
+    const cls: Cls = clsOf(a.t) === 'i64' || clsOf(b.t) === 'i64' ? 'i64' : 'i32';
+    let pa = this.exAs(a, cls);
+    let pb = this.exAs(b, cls);
+    if (op === 'eq' || op === 'neq') return `(${cls}.${op === 'eq' ? 'eq' : 'ne'} ${pa} ${pb})`;
+    const rel = { lt: 'lt', lte: 'le', gt: 'gt', gte: 'ge' }[op as 'lt'];
+    if (signed) {
+      // VL_LTS_III(lbits, ...): sign extend both operands from lbits
+      const lbits = widthMinOf(a);
+      pa = this.sext(pa, cls, lbits);
+      pb = this.sext(pb, cls, lbits);
+      return `(${cls}.${rel}_s ${pa} ${pb})`;
+    }
+    return `(${cls}.${rel}_u ${pa} ${pb})`;
+  }
+
+  // --- wide expressions ---
+
+  /** address of a wide value with at least 'words' words (zero extended) */
+  private wideAddrN(e: VExpr, words: number): string {
+    if (isWide(e.t) && numWords(e.t as VLogicType) >= words) return this.wideAddr(e);
+    const tmp = this.allocWide(words);
+    return `(block (result i32) ${this.toWide(e, tmp, words, false)} ${i32c(tmp)})`;
+  }
+
+  /** store any value zero/sign-extended to 'words' words at dst */
+  private toWide(e: VExpr, dst: number, words: number, signed: boolean): string {
+    if (isWide(e.t)) {
+      return `(call $w_extend ${i32c(dst)} ${i32c(words)} ${this.wideAddr(e)} ${i32c((e.t as VLogicType).width)} ${i32c(signed ? 1 : 0)})`;
+    }
+    const v = this.exAs(e, 'i64');
+    if (signed) return `(call $w_sext64 ${i32c(dst)} ${i32c(words)} ${v} ${i32c(widthMinOf(e))})`;
+    return `(call $w_from64 ${i32c(dst)} ${i32c(words)} ${v})`;
+  }
+
+  /** address where a wide value can be read */
+  private wideAddr(e: VExpr): string {
+    if (!isWide(e.t)) throw new HDLError(e, `expected a wide value, got ${describeType(e.t)}`);
+    const words = numWords(e.t as VLogicType);
+    switch (e.k) {
+      case 'var':
+        return this.varAddrCode(e.v);
+      case 'const':
+        return i32c(this.wideConst(e.value, words));
+      case 'op':
+        if (e.op === 'arraysel') return this.lvAddr(e);
+        break;
+      case 'call':
+        throw new HDLError(e, `functions returning wide values are not supported`);
+      case 'sys':
+        throw new HDLError(e, `unsupported wide system function ${e.name}`);
+    }
+    const tmp = this.allocWide(words);
+    return `(block (result i32) ${this.wideInto(e, i32c(tmp), words)} ${i32c(tmp)})`;
+  }
+
+  /** compute a wide operation into dst (an address expression, evaluated once) */
+  private wideInto(e: VExpr, dstCode: string, words: number): string {
+    if (e.k !== 'op') {
+      return `(call $w_copy ${dstCode} ${this.wideAddr(e)} ${i32c(words)})`;
+    }
+    const t = e.t as VLogicType;
+    const [a, b] = e.args;
+    // dst may be an expression with side effects (array index): evaluate it once
+    let pre = '';
+    let dst = dstCode;
+    if (!/^\(i32\.const -?\d+\)$/.test(dstCode)) {
+      const d = this.tmp('i32');
+      pre = `(local.set ${d} ${dstCode})`;
+      dst = `(local.get ${d})`;
+    }
+    const W = i32c(words);
+    const opA = () => this.wideAddrN(a, words);
+    const opB = () => this.wideAddrN(b, words);
+    let code: string;
+    switch (e.op) {
+      case 'add':
+      case 'sub':
+      case 'mul':
+      case 'and':
+      case 'or':
+      case 'xor':
+        code = `(call $w_${e.op} ${dst} ${opA()} ${opB()} ${W})`;
+        break;
+      case 'not':
+        code = `(call $w_not ${dst} ${opA()} ${W})`;
+        break;
+      case 'negate':
+        code = `(call $w_neg ${dst} ${opA()} ${W})`;
+        break;
+      case 'div':
+      case 'moddiv':
+        code = `(call $w_divmod ${dst} ${opA()} ${opB()} ${W} ${i32c(e.op === 'moddiv' ? 1 : 0)})`;
+        break;
+      case 'divs':
+      case 'moddivs':
+        code = `(call $w_divs ${dst} ${opA()} ${opB()} ${i32c(widthMinOf(a))} ${i32c(e.op === 'moddivs' ? 1 : 0)})`;
+        break;
+      case 'muls': {
+        // signed multiply: |a| * |b|, negate if signs differ
+        const lbits = widthMinOf(a);
+        const ta = this.allocWide(words);
+        const tb = this.allocWide(words);
+        const neg = this.tmp('i32');
+        const signOf = (p: string) =>
+          `(i32.and (i32.shr_u (i32.load (i32.add ${p} ${i32c(((lbits - 1) >> 5) * 4)})) ${i32c((lbits - 1) & 31)}) (i32.const 1))`;
+        code = `(call $w_copy ${i32c(ta)} ${opA()} ${W}) (call $w_copy ${i32c(tb)} ${opB()} ${W})
+          (local.set ${neg} (i32.xor ${signOf(i32c(ta))} ${signOf(i32c(tb))}))
+          (if ${signOf(i32c(ta))} (then (call $w_neg ${i32c(ta)} ${i32c(ta)} ${W}) (call $w_clean ${i32c(ta)} ${i32c(lbits)})))
+          (if ${signOf(i32c(tb))} (then (call $w_neg ${i32c(tb)} ${i32c(tb)} ${W}) (call $w_clean ${i32c(tb)} ${i32c(lbits)})))
+          (call $w_mul ${dst} ${i32c(ta)} ${i32c(tb)} ${W})
+          (call $w_clean ${dst} ${i32c(lbits)})
+          (if (local.get ${neg}) (then (call $w_neg ${dst} ${dst} ${W})))`;
+        break;
+      }
+      case 'shiftl':
+      case 'shiftlovr':
+        code = `(call $w_shl ${dst} ${opA()} ${this.shamt(b)} ${i32c(t.widthMin)})`;
+        break;
+      case 'shiftr':
+      case 'shiftrovr':
+        code = `(call $w_shr ${dst} ${opA()} ${this.shamt(b)} ${i32c(t.widthMin)})`;
+        break;
+      case 'shiftrs':
+      case 'shiftrsovr':
+        code = `(call $w_shrs ${dst} ${opA()} ${this.shamt(b)} ${i32c(t.widthMin)} ${i32c(widthMinOf(a))})`;
+        break;
+      case 'ccast':
+      case 'extend':
+        code = this.toWideDyn(a, dst, words, false);
+        break;
+      case 'extends':
+        code = this.toWideDyn(a, dst, words, true);
+        break;
+      case 'cond': {
+        const [c, x, y] = e.args;
+        code = `(if ${this.cond(c)} (then (call $w_copy ${dst} ${this.wideAddrN(x, words)} ${W}))
+          (else (call $w_copy ${dst} ${this.wideAddrN(y, words)} ${W})))`;
+        break;
+      }
+      case 'concat': {
+        const rw = (b.t as VLogicType).width;
+        const lw = (a.t as VLogicType).width;
+        code = `(call $w_zero ${dst} ${W})
+          (call $w_insert ${dst} (i32.const 0) ${i32c(rw)} ${this.wideAddrN(b, wordsOf(b.t))})
+          (call $w_insert ${dst} ${i32c(rw)} ${i32c(lw)} ${this.wideAddrN(a, wordsOf(a.t))})`;
+        break;
+      }
+      case 'replicate': {
+        if (b.k !== 'const') throw new HDLError(e, 'replication count must be constant');
+        const sw = (a.t as VLogicType).width;
+        const src = this.tmp('i32');
+        code = `(call $w_zero ${dst} ${W}) (local.set ${src} ${this.wideAddrN(a, wordsOf(a.t))})`;
+        for (let i = 0; i < Number(b.value); i++) {
+          code += ` (call $w_insert ${dst} ${i32c(i * sw)} ${i32c(sw)} (local.get ${src}))`;
+        }
+        break;
+      }
+      case 'sel': {
+        const [from, lsb] = e.args;
+        code = `(call $w_extract ${dst} ${W} ${this.wideAddrN(from, wordsOf(from.t))} ${i32c(wordsOf(from.t))} ${this.exAs(lsb, 'i32')})
+          (call $w_clean ${dst} ${i32c(t.width)})`;
+        break;
+      }
+      case 'arraysel':
+        code = `(call $w_copy ${dst} ${this.lvAddr(e)} ${W})`;
+        break;
+      default:
+        throw new HDLError(e, `unsupported operation ${e.op} on ${describeType(t)}`);
+    }
+    return pre + code;
+  }
+
+  private toWideDyn(e: VExpr, dst: string, words: number, signed: boolean) {
+    if (isWide(e.t)) {
+      return `(call $w_extend ${dst} ${i32c(words)} ${this.wideAddr(e)} ${i32c(widthMinOf(e))} ${i32c(signed ? 1 : 0)})`;
+    }
+    const v = this.exAs(e, 'i64');
+    if (signed) return `(call $w_sext64 ${dst} ${i32c(words)} ${v} ${i32c(widthMinOf(e))})`;
+    return `(call $w_from64 ${dst} ${i32c(words)} ${v})`;
+  }
+
+  // --- top level driver ---
+
+  private genDriver(): string {
+    const has = (name: string) => this.model.funcs.find((f) => f.name === name);
+    const callIf = (name: string) => (has(name) ? `(call $${name})` : '');
+    const didinit = this.globals.lookup(DIDINIT).offset;
+    const t = (name: string) => this.globals.lookup(name).offset;
+    const clk = this.globals.lookup('clk');
+    const setClk = (v: number) =>
+      clk
+        ? this.store(i32c(clk.offset), clk.size, clsOf(clk.type!), constOf(clsOf(clk.type!), v))
+        : '';
+    return `
+  (func $__ctor (export "ctor") ${callIf('_ctor_var_reset')})
+  (func $__eval (export "eval")
+    (if (i32.eqz (i32.load ${i32c(didinit)})) (then
+      ${callIf('_eval_static')} ${callIf('_eval_initial')} ${callIf('_eval_settle')}
+      (i32.store ${i32c(didinit)} (i32.const 1))))
+    ${callIf('_eval')})
+  (func $__final (export "final") ${callIf('_eval_final')})
+  (func $copyTraceRec (local $src i32) (local $len i32) (local $dst i32)
+    (local.set $len (i32.load ${i32c(t(TRACERECLEN))}))
+    (local.set $dst (i32.load ${i32c(t(TRACEOFS))}))
+    (memory.copy (local.get $dst) (i32.const 0) (local.get $len))
+    (i32.store ${i32c(t(TRACEOFS))} (i32.add (local.get $dst) (local.get $len)))
+    (if (i32.ge_u (i32.load ${i32c(t(TRACEOFS))}) (i32.load ${i32c(t(TRACEEND))}))
+      (then (i32.store ${i32c(t(TRACEOFS))} ${i32c(t(TRACEBUF))}))))
+  (func $__tick2 (export "tick2") (param $n i32)
+    (block $done (loop $lp
+      (br_if $done (i32.le_s (local.get $n) (i32.const 0)))
+      ${setClk(0)}
+      (call $__eval)
+      ${setClk(1)}
+      (call $__eval)
+      (call $copyTraceRec)
+      (local.set $n (i32.sub (local.get $n) (i32.const 1)))
+      (br $lp))))`;
   }
 }
 
-///
+function wordsOf(t: VType) {
+  return isLogic(t) ? Math.max(numWords(t), 1) : 1;
+}
+
+function widthMinOf(e: VExpr) {
+  return isLogic(e.t) ? e.t.widthMin || e.t.width : 32;
+}
+
+function escapeBytes(bytes: Uint8Array) {
+  let s = '';
+  for (const b of bytes) s += '\\' + b.toString(16).padStart(2, '0');
+  return s;
+}
+
+function exprUsesVar(e: VExpr, v: VVar): boolean {
+  switch (e.k) {
+    case 'var':
+      return e.v === v;
+    case 'const':
+      return false;
+    default:
+      return e.args.some((a) => exprUsesVar(a, v));
+  }
+}
+
+/** locals passed by reference to other functions must live in memory */
+function collectByRefArgs(stmts: VStmt[], out: Set<string>) {
+  const visitExpr = (e: VExpr) => {
+    if (e.k === 'call') {
+      e.func.args.forEach((p, i) => {
+        const a = e.args[i];
+        if (a && a.k === 'var' && (p.byRef || !isScalar(p.type))) out.add(a.v.id);
+      });
+    }
+    if (e.k === 'op' || e.k === 'call' || e.k === 'sys') e.args.forEach(visitExpr);
+  };
+  for (const s of stmts) {
+    switch (s.s) {
+      case 'assign':
+        visitExpr(s.lhs);
+        visitExpr(s.rhs);
+        break;
+      case 'creset':
+        visitExpr(s.lhs);
+        break;
+      case 'if':
+        visitExpr(s.cond);
+        collectByRefArgs(s.then, out);
+        collectByRefArgs(s.else, out);
+        break;
+      case 'loop':
+      case 'jumpblock':
+        collectByRefArgs(s.body, out);
+        break;
+      case 'looptest':
+        visitExpr(s.cond);
+        break;
+      case 'return':
+        if (s.value) visitExpr(s.value);
+        break;
+      case 'expr':
+        visitExpr(s.e);
+        break;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Runtime
+// ---------------------------------------------------------------------------
 
 export class HDLModuleWASM implements HDLModuleRunner {
-  bmod!: binaryen.Module;
+  model: VModel;
+  bmod: binaryen.Module | null = null;
   instance!: WebAssembly.Instance;
-
-  hdlmod: HDLModuleDef;
-  constpool: HDLModuleDef | null;
   globals!: Struct;
-  locals!: Struct;
   databuf!: ArrayBuffer;
   data8!: Uint8Array;
   data16!: Uint16Array;
   data32!: Uint32Array;
   getFileData: ((filename: string) => string | Uint8Array | undefined) | null = null;
   maxMemoryMB: number;
-  optimize: boolean = false;
-  maxEvalIterations: number = 8;
+  optimize: boolean;
 
   state: any;
   statebytes!: number;
@@ -266,66 +1124,128 @@ export class HDLModuleWASM implements HDLModuleRunner {
   traceEndOffset!: number;
   trace: any;
 
-  randomizeOnReset: boolean = false;
-  finished!: boolean;
-  stopped!: boolean;
-  resetStartTimeMsec!: number;
+  finished = false;
+  stopped = false;
+  resetStartTimeMsec = 0;
 
-  rawwasm!: string;
+  /** WAT source of the generated module (for debugging) */
+  wat = '';
+  private fatalMessages: string[] = [];
+  private wasmBinary!: Uint8Array;
+  private _eval!: () => void;
+  private _tick2!: (iters: number) => void;
+  private _ctor!: () => void;
 
-  _tick2!: (ofs: number, iters: number) => void;
+  constructor(model: VModel, opts: Options | number = {}) {
+    if (typeof opts === 'number') opts = { maxMemoryMB: opts };
+    this.model = model;
+    this.maxMemoryMB = opts.maxMemoryMB ?? 64;
+    this.optimize = opts.optimize ?? true;
+    this.compile();
+  }
 
-  constructor(moddef: HDLModuleDef, constpool: HDLModuleDef | null, maxMemoryMB?: number) {
-    this.hdlmod = moddef;
-    this.constpool = constpool;
-    this.maxMemoryMB = maxMemoryMB || 16;
-    this.genMemory();
-    this.genFuncs();
-    this.validate();
+  /** for debugging: the generated WAT (before optimization) */
+  get rawwasm() {
+    return this.wat;
+  }
+
+  private compile() {
+    const gen = new WatGen(this.model, this.traceBufferSize);
+    this.wat = gen.generate();
+    this.globals = gen.globals;
+    this.statebytes = gen.statebytes;
+    this.outputbytes = gen.outputbytes;
+    this.traceRecordSize = gen.outputbytes;
+    this.fatalMessages = gen.fatalMessages;
+    if (gen.globals.len > this.maxMemoryMB * 1024 * 1024) {
+      throw new HDLError(
+        null,
+        `cannot allocate ${gen.globals.len} bytes, limit is ${this.maxMemoryMB} MB`,
+      );
+    }
+    const bmod = binaryen.parseText(this.wat);
+    this.bmod = bmod;
+    bmod.setFeatures(
+      binaryen.Features.MVP |
+        binaryen.Features.SignExt |
+        binaryen.Features.BulkMemory |
+        binaryen.Features.MutableGlobals |
+        binaryen.Features.NontrappingFPToInt,
+    );
+    if (!bmod.validate()) {
+      throw new HDLError(null, `could not validate wasm module`);
+    }
+    if (this.optimize) {
+      binaryen.setOptimizeLevel(2);
+      binaryen.setShrinkLevel(0);
+      bmod.optimize();
+    }
+    this.wasmBinary = bmod.emitBinary();
+    bmod.dispose();
+    this.bmod = null;
   }
 
   async init() {
-    await this.genModule();
-    this.genStateInterface();
-    this.enableTracing();
-    this.cacheFunctions();
+    const compiled = await WebAssembly.compile(this.wasmBinary as BufferSource);
+    this.instance = await WebAssembly.instantiate(compiled, this.getImportObject());
+    this.afterInstantiate();
   }
 
   initSync() {
-    this.genModuleSync();
-    this.genStateInterface();
+    const compiled = new WebAssembly.Module(this.wasmBinary as BufferSource);
+    this.instance = new WebAssembly.Instance(compiled, this.getImportObject());
+    this.afterInstantiate();
+  }
+
+  private afterInstantiate() {
+    const exp = this.instance.exports as any;
+    this._eval = exp.eval;
+    this._tick2 = exp.tick2;
+    this._ctor = exp.ctor;
+    this.databuf = (exp.memory as WebAssembly.Memory).buffer;
+    this.data8 = new Uint8Array(this.databuf);
+    this.data16 = new Uint16Array(this.databuf);
+    this.data32 = new Uint32Array(this.databuf);
+    this.state = this.makeScopeProxy(() => 0);
     this.enableTracing();
-    this.cacheFunctions();
+    this.powercycle();
   }
 
-  private cacheFunctions() {
-    // Cache the tick2 function for performance:
-    this._tick2 = (this.instance.exports as any).tick2;
+  private getImportObject(): WebAssembly.Imports {
+    return {
+      builtins: {
+        finish: (line: number) => {
+          if (!this.finished) console.log('... $finish @ line', line);
+          this.finished = true;
+        },
+        stop: (line: number) => {
+          if (!this.stopped) console.log('... $stop @ line', line);
+          this.stopped = true;
+        },
+        fatal: (id: number) => {
+          this.stopped = true;
+          throw new HDLError(null, this.fatalMessages[id] ?? 'fatal error');
+        },
+        time: () => BigInt(Date.now() - this.resetStartTimeMsec),
+        random: () => (Math.random() * 4294967296) | 0,
+      },
+    };
   }
 
+  /**
+   * Reset the model to its power-on state (like constructing a new Verilated
+   * model). Initial blocks run on the next eval(), with the inputs set then.
+   */
   powercycle() {
-    // TODO: merge w/ JS runtime
-    this.resetStartTimeMsec = new Date().getTime() - 1;
+    this.resetStartTimeMsec = Date.now() - 1;
     this.finished = false;
     this.stopped = false;
-    this.clearMutableState();
-    this.setInitialValues();
-    (this.instance.exports as any)._ctor_var_reset(GLOBALOFS); // Called when constructing class
-    (this.instance.exports as any)._eval_static(GLOBALOFS);
-    (this.instance.exports as any)._eval_initial(GLOBALOFS);
-    for (var i = 0; i < 100; i++) {
-      (this.instance.exports as any)._eval_settle(GLOBALOFS);
-      (this.instance.exports as any)._eval(GLOBALOFS);
-      /*var VstlPhaseResult = (this.instance.exports as any)._eval_phase__stl(GLOBALOFS);
-      if (!VstlPhaseResult) {*/
-      return;
-      //}
-    }
-    throw new HDLError(null, `model did not converge on reset()`);
+    this.data8.fill(0, 0, this.statebytes);
+    this._ctor();
   }
 
   eval() {
-    (this.instance.exports as any).eval(GLOBALOFS);
+    this._eval();
   }
 
   tick() {
@@ -334,7 +1254,7 @@ export class HDLModuleWASM implements HDLModuleRunner {
   }
 
   tick2(iters: number) {
-    this._tick2(GLOBALOFS, iters);
+    this._tick2(iters);
   }
 
   isFinished() {
@@ -350,37 +1270,42 @@ export class HDLModuleWASM implements HDLModuleRunner {
   }
 
   loadState(state: { o: Uint8Array }) {
-    this.data8.set(state.o as Uint8Array);
+    this.data8.set(state.o);
   }
 
-  // get tree of global variables for debugging
   getGlobals() {
-    var g: Record<string, any> = {};
-    for (const [varname, vardef] of Object.entries(this.hdlmod.vardefs)) {
-      var o: Record<string, any> = g;
-      var toks = varname.split('$');
-      for (var tok of toks.slice(0, -1)) {
+    const g: Record<string, any> = {};
+    for (const v of this.model.vars) {
+      let o: Record<string, any> = g;
+      const toks = v.name.split('__DOT__');
+      for (const tok of toks.slice(0, -1)) {
         o[tok] = o[tok] || {};
         o = o[tok];
       }
-      o[toks[toks.length - 1]] = this.state[varname];
+      o[toks[toks.length - 1]] = this.state[v.name];
     }
     return g;
   }
 
+  dispose() {
+    this.instance = null as any;
+    this.databuf = null as any;
+    this.data8 = null as any;
+    this.data16 = null as any;
+    this.data32 = null as any;
+  }
+
+  // --- tracing (outputs are copied to a ring buffer on every tick2 cycle) ---
+
   enableTracing() {
     if (this.outputbytes == 0) throw new Error(`outputbytes == 0`);
     if (this.outputbytes % 8) throw new Error(`outputbytes must be 8-byte aligned`);
-    if (this.traceBufferSize % 8) throw new Error(`trace buffer size must be 8-byte aligned`);
     this.traceStartOffset = this.globals.lookup(TRACEBUF).offset;
     this.traceEndOffset = this.traceStartOffset + this.traceBufferSize - this.outputbytes;
     this.state[TRACEEND] = this.traceEndOffset;
     this.state[TRACERECLEN] = this.outputbytes;
     this.resetTrace();
-    //console.log(this.state[TRACEOFS], this.state[TRACERECLEN], this.state[TRACEEND]);
-    this.trace = this.makeScopeProxy(() => {
-      return this.traceReadOffset;
-    });
+    this.trace = this.makeScopeProxy(() => this.traceReadOffset);
   }
 
   resetTrace() {
@@ -397,2839 +1322,67 @@ export class HDLModuleWASM implements HDLModuleRunner {
     return this.traceRecordSize;
   }
 
-  dispose() {
-    if (this.bmod) {
-      this.bmod.dispose();
-      this.bmod = null as any;
-      this.instance = null as any;
-      this.databuf = null as any;
-      this.data8 = null as any;
-      this.data16 = null as any;
-      this.data32 = null as any;
-    }
+  // --- JS access to the state ---
+
+  private makeScopeProxy(basefn: () => number): {} {
+    const proxy = Object.create(null);
+    for (const rec of Object.values(this.globals.vars)) this.defineProperty(proxy, basefn, rec);
+    return proxy;
   }
 
-  //
-
-  private genMemory() {
-    this.bmod = new binaryen.Module();
-    this.bmod.setFeatures(binaryen.Features.SignExt);
-    this.genTypes();
-    var membytes = this.globals.len;
-    if (membytes > this.maxMemoryMB * 1024 * 1024)
-      throw new HDLError(
-        null,
-        `cannot allocate ${membytes} bytes, limit is ${this.maxMemoryMB} MB`,
-      );
-    var memblks = Math.ceil(membytes / 65536);
-    this.bmod.setMemory(memblks, memblks, MEMORY); // memory is in 64k chunks
-  }
-
-  private genTypes() {
-    // generate global variables
-    var state = new Struct();
-    this.globals = state;
-    // separate vars and constants
-    var vardefs = Object.values(this.hdlmod.vardefs).filter((vd) => vd.constValue == null);
-    var constdefs = Object.values(this.hdlmod.vardefs).filter((vd) => vd.constValue != null);
-    // sort globals by output flag and size
-    function getVarDefSortKey(vdef: HDLVariableDef) {
-      var val = getDataTypeSize(vdef.dtype); // sort by size
-      if (!vdef.isOutput) val += 1000000; // outputs are first in list
-      return val;
-    }
-    vardefs.sort((a, b) => {
-      return getVarDefSortKey(a) - getVarDefSortKey(b);
-    });
-    // outputs are contiguous so we can copy them to the trace buffer
-    // so we put them all first in the struct order
-    for (var vardef of vardefs) {
-      if (vardef.isOutput) state.addVar(vardef);
-    }
-    if (state.len == 0) state.addEntry('___', 1); // ensure as least 8 output bytes for trace buffer
-    state.alignTo(8);
-    this.outputbytes = state.len;
-    // followed by inputs and internal vars (arrays after logical types)
-    for (var vardef of vardefs) {
-      if (!vardef.isOutput) state.addVar(vardef);
-    }
-    state.alignTo(8);
-    this.statebytes = state.len;
-    // followed by constants and constant pool
-    if (this.constpool) {
-      for (const vardef of Object.values(constdefs)) {
-        state.addVar(vardef);
-      }
-      for (const vardef of Object.values(this.constpool.vardefs)) {
-        state.addVar(vardef);
+  private defineProperty(proxy: any, basefn: () => number, rec: StructRec) {
+    const self = this;
+    const t = rec.type;
+    let get: () => any;
+    let set: (v: any) => void;
+    if (t && isArray(t)) {
+      const es = typeSize(t.elem);
+      const ctor =
+        es === 1 ? Uint8Array : es === 2 ? Uint16Array : es === 8 ? BigUint64Array : Uint32Array;
+      get = () =>
+        new (ctor as any)(self.databuf, basefn() + rec.offset, rec.size / ctor.BYTES_PER_ELEMENT);
+      set = () => {
+        throw new HDLError(rec, `cannot assign array ${rec.name}`);
+      };
+    } else if (t && isLogic(t) && t.width > 32) {
+      const words = Math.ceil(t.width / 32);
+      const mask = maskBits(t.width);
+      get = () => {
+        const base = (basefn() + rec.offset) >> 2;
+        let r = 0n;
+        for (let i = words - 1; i >= 0; i--) r = (r << 32n) | BigInt(self.data32[base + i]);
+        return r & mask;
+      };
+      set = (value) => {
+        const base = (basefn() + rec.offset) >> 2;
+        let v = BigInt(value) & mask;
+        for (let i = 0; i < words; i++) {
+          self.data32[base + i] = Number(v & 0xffffffffn);
+          v >>= 32n;
+        }
+      };
+    } else {
+      const width = t && isLogic(t) ? t.width : rec.size * 8;
+      const mask = width >= 32 ? 0xffffffff : (1 << width) - 1;
+      if (rec.size === 1) {
+        get = () => self.data8[basefn() + rec.offset];
+        set = (v) => (self.data8[basefn() + rec.offset] = Number(v) & mask);
+      } else if (rec.size === 2) {
+        get = () => self.data16[(basefn() + rec.offset) >> 1];
+        set = (v) => (self.data16[(basefn() + rec.offset) >> 1] = Number(v) & mask);
+      } else {
+        get = () => self.data32[(basefn() + rec.offset) >> 2];
+        set = (v) => (self.data32[(basefn() + rec.offset) >> 2] = Number(v) & mask);
       }
     }
-    state.alignTo(8);
-    // and now the trace buffer
-    state.addEntry(TRACERECLEN, 4, binaryen.i32);
-    state.addEntry(TRACEOFS, 4, binaryen.i32);
-    state.addEntry(TRACEEND, 4, binaryen.i32);
-    state.addEntry(TRACEBUF, this.traceBufferSize);
-    this.traceRecordSize = this.outputbytes;
-  }
-
-  private genFuncs() {
-    // function type (dsegptr)
-    for (var block of this.hdlmod.blocks) {
-      this.genFunction(block);
-    }
-    // export functions
-    for (var fname of VERILATOR_UNIT_FUNCTIONS) {
-      this.bmod.addFunctionExport(fname, fname);
-    }
-    // create helper functions
-    this.addHelperFunctions();
-    // link imported functions
-    this.addImportedFunctions();
-  }
-
-  private validate() {
-    // optimize wasm module (default passes crash binaryen.js)
-    this.rawwasm = this.bmod.emitText(); // For debugging purposes
-    if (this.optimize) {
-      var size = this.bmod.emitBinary().length;
-      // TODO: more passes?
-      // https://github.com/WebAssembly/binaryen/blob/369b8bdd3d9d49e4d9e0edf62e14881c14d9e352/src/passes/pass.cpp#L396
-      this.bmod.runPasses([
-        'dce',
-        'optimize-instructions',
-        'precompute',
-        'simplify-locals',
-        'simplify-globals',
-        'rse',
-        'vacuum' /*,'dae-optimizing','inlining-optimizing'*/,
-      ]);
-      var optsize = this.bmod.emitBinary().length;
-      console.log('optimize', size, '->', optsize);
-    }
-    // validate wasm module
-    if (!this.bmod.validate()) {
-      //console.log(this.bmod.emitText());
-      throw new HDLError(null, `could not validate wasm module`);
-    }
-  }
-
-  private genFunction(block: HDLBlock) {
-    // TODO: cfuncs only
-    var fnname = block.name;
-    // find locals of function
-    var fscope = new Struct();
-    fscope.addEntry(GLOBAL, 4, binaryen.i32, undefined, true); // 1st param to function
-    var args = [binaryen.i32]; // pass dataptr()
-    this.pushScope(fscope);
-    block.exprs.forEach((e) => {
-      if (e && isVarDecl(e)) {
-        if (e.isParam) {
-          var size = getDataTypeSize(e.dtype);
-          var typ = getBinaryenType(size);
-          if (isArrayType(e.dtype)) {
-            // If array, we pass the reference instead
-            fscope.addEntry(e.name, 4, binaryen.i32, undefined, true);
-            args.push(binaryen.i32);
-          } else if (typ != binaryen.none) {
-            fscope.addEntry(e.name, size, typ, undefined, true);
-            args.push(typ);
-          } else {
-            throw new HDLError(e, 'we cannot support arguments other than 32 and 64 bits');
-          }
-        } else if (isArrayType(e.dtype)) {
-          // TODO: make local reference types, instead of promoting local arrays to global
-          this.globals.addVar(e);
-        } else {
-          fscope.addVar(e);
-        }
-      }
-    });
-    // create function body
-    var fbody = this.block2wasm(block, { funcblock: block });
-    //var fbody = this.bmod.return(this.bmod.i32.const(0));
-    var fret = this.funcResult(block);
-    var fsig = binaryen.createType(args); // pass dataptr()
-    var fref = this.bmod.addFunction(fnname, fsig, fret, fscope.getLocals(), fbody);
-    this.bmod.addFunctionExport(fnname, 'EXPORT_' + fnname); // JUST TO DEBUG
-    this.popScope();
-  }
-
-  private async genModule() {
-    var wasmData = this.bmod.emitBinary() as BufferSource;
-    var compiled = await WebAssembly.compile(wasmData);
-    this.instance = await WebAssembly.instantiate(compiled, this.getImportObject());
-  }
-
-  private genModuleSync() {
-    var wasmData = this.bmod.emitBinary() as BufferSource;
-    var compiled = new WebAssembly.Module(wasmData);
-    this.instance = new WebAssembly.Instance(compiled, this.getImportObject());
-  }
-
-  private genStateInterface() {
-    this.databuf = (this.instance.exports[MEMORY] as WebAssembly.Memory).buffer;
-    this.data8 = new Uint8Array(this.databuf);
-    this.data16 = new Uint16Array(this.databuf);
-    this.data32 = new Uint32Array(this.databuf);
-    // proxy object to access globals (starting from 0)
-    this.state = this.makeScopeProxy(() => {
-      return 0;
-    });
-  }
-
-  private defineProperty(proxy: any, basefn: () => number, vref: StructRec) {
-    var _this = this;
-    // precompute some things
-    var elsize = vref.type && getArrayElementSizeFromType(vref.type);
-    var eltype = vref.type;
-    while (eltype && isArrayType(eltype)) {
-      eltype = eltype.subtype;
-    }
-    var mask = -1; // set all bits
-    if (eltype && isLogicType(eltype) && eltype.left < 31) {
-      mask = (1 << (eltype.left + 1)) - 1; // set partial bits
-    }
-    // Any logic type with more than 32 bits is exposed as a BigInt and stored
-    // as 32-bit chunks in memory (whether it fits in a native i64 or is truly
-    // wide). Precompute the chunk count and mask once so get/set stay tight.
-    var useBigInt = vref.type && isLogicType(vref.type) && vref.type.left > 31;
-    var numChunks = useBigInt ? Math.ceil(((vref.type as HDLLogicType).left + 1) / 32) : 0;
-    var bigMask = useBigInt ? (1n << BigInt((vref.type as HDLLogicType).left + 1)) - 1n : 0n;
-    // define get/set on proxy object
-    Object.defineProperty(proxy, vref.name, {
-      get() {
-        let base = basefn();
-        if (vref.type && isArrayType(vref.type)) {
-          // TODO: can't mask unused bits in array
-          if (elsize == 1) {
-            return new Uint8Array(_this.databuf, base + vref.offset, vref.size);
-          } else if (elsize == 2) {
-            return new Uint16Array(_this.databuf, (base >> 1) + vref.offset, vref.size >> 1);
-          } else if (elsize == 4) {
-            return new Uint32Array(_this.databuf, (base >> 2) + vref.offset, vref.size >> 2);
-          }
-        } else {
-          if (vref.size == 1) {
-            return _this.data8[base + vref.offset];
-          } else if (vref.size == 2) {
-            return _this.data16[(base + vref.offset) >> 1];
-          } else if (vref.size == 4) {
-            return _this.data32[(base + vref.offset) >> 2];
-          } else if (useBigInt) {
-            let result = 0n;
-            const startIdx = (base + vref.offset) >> 2;
-            for (let i = 0; i < numChunks; i++) {
-              result |= BigInt(_this.data32[startIdx + i]) << BigInt(i * 32);
-            }
-            return result & bigMask;
-          }
-        }
-        return new Uint32Array(_this.databuf, (base >> 2) + vref.offset, vref.size >> 2);
-      },
-      set(value) {
-        var base = basefn();
-        if (vref.size == 1) {
-          _this.data8[base + vref.offset] = value & mask;
-          return true;
-        } else if (vref.size == 2) {
-          _this.data16[(base + vref.offset) >> 1] = value & mask;
-          return true;
-        } else if (vref.size == 4) {
-          _this.data32[(base + vref.offset) >> 2] = value & mask;
-          return true;
-        } else if (useBigInt) {
-          let bigValue = BigInt(value) & bigMask;
-          const startIdx = (base + vref.offset) >> 2;
-          for (let i = 0; i < numChunks; i++) {
-            _this.data32[startIdx + i] = Number(bigValue & 0xffffffffn);
-            bigValue >>= 32n;
-          }
-          return true;
-        } else {
-          throw new HDLError(vref, `can't set property ${vref.name}`);
-        }
+    Object.defineProperty(proxy, rec.name, {
+      get,
+      set(v) {
+        set(v);
+        return true;
       },
       enumerable: true,
       configurable: false,
     });
-  }
-
-  private makeScopeProxy(basefn: () => number): {} {
-    var proxy = Object.create(null); // no inherited properties
-    for (var vref of Object.values(this.globals.vars)) {
-      if (vref != null) this.defineProperty(proxy, basefn, vref);
-    }
-    return proxy;
-  }
-
-  setInitialValues() {
-    for (var rec of this.globals.locals) {
-      this.setInitialValue(rec);
-    }
-  }
-
-  private setInitialValue(rec: StructRec) {
-    var arr = this.state[rec.name];
-    if (rec.init) {
-      if (!arr) throw new HDLError(rec, `no array to init`);
-      for (let i = 0; i < rec.init.exprs.length; i++) {
-        let e = rec.init.exprs[i];
-        if (isArrayItem(e) && isConstExpr(e.expr)) {
-          arr[e.index] = e.expr.cvalue;
-        } else {
-          throw new HDLError(
-            e,
-            `non-const expr in initarray (multidimensional arrays not supported)`,
-          );
-        }
-      }
-      //console.log(rec.name, rec.type, arr);
-    } else if (rec.constval) {
-      // Use cvalue if it's a number (even 0), otherwise use bigvalue for large constants
-      this.state[rec.name] =
-        typeof rec.constval.cvalue === 'number' ? rec.constval.cvalue : rec.constval.bigvalue;
-    } else if (rec.type && rec.reset && this.randomizeOnReset) {
-      if (isLogicType(rec.type) && typeof arr === 'number') {
-        this.state[rec.name] = Math.random() * 4294967296; // don't need to mask
-      } else if (isArrayType(rec.type) && isLogicType(rec.type.subtype)) {
-        // array types are't mask-protected yet
-        var mask = (1 << (rec.type.subtype.left + 1)) - 1;
-        for (var i = 0; i < arr.length; i++) {
-          arr[i] = (Math.random() * 4294967296) & mask;
-        }
-      } else {
-        console.log(`could not reset ${rec.name}`);
-      }
-    }
-  }
-
-  clearMutableState() {
-    this.data32.fill(0, 0, this.statebytes >> 2);
-  }
-
-  private addHelperFunctions() {
-    this.addCopyTraceRecFunction();
-    this.addEvalFunction();
-    this.addTick2Function();
-    this.make_V1Unpacked_loadbit_i32();
-    this.make_V1Unpacked_loadbit_i64();
-    this.make_V1Unpacked_storebit_i32();
-    this.make_V1Unpacked_storebit_i64();
-  }
-
-  private addImportedFunctions() {
-    this.bmod.addFunctionImport(
-      '$finish_0',
-      'builtins',
-      '$finish',
-      binaryen.createType([binaryen.i32]),
-      binaryen.none,
-    );
-    this.bmod.addFunctionImport(
-      '$stop_0',
-      'builtins',
-      '$stop',
-      binaryen.createType([binaryen.i32]),
-      binaryen.none,
-    );
-    this.bmod.addFunctionImport(
-      '$time_0',
-      'builtins',
-      '$time',
-      binaryen.createType([binaryen.i32]),
-      binaryen.i64,
-    );
-    this.bmod.addFunctionImport(
-      '$rand_0',
-      'builtins',
-      '$rand',
-      binaryen.createType([binaryen.i32]),
-      binaryen.i32,
-    );
-    this.bmod.addFunctionImport(
-      '$readmem_2',
-      'builtins',
-      '$readmem',
-      binaryen.createType([binaryen.i32, binaryen.i32, binaryen.i32]),
-      binaryen.none,
-    );
-  }
-
-  private getImportObject(): {} {
-    var n = 0;
-    return {
-      // TODO: merge w/ JS runtime
-      builtins: {
-        $finish: (o: number) => {
-          if (!this.finished) console.log('... Finished @', o);
-          this.finished = true;
-        },
-        $stop: (o: number) => {
-          if (!this.stopped) console.log('... Stopped @', o);
-          this.stopped = true;
-        },
-        $time: (o: number) => BigInt(new Date().getTime() - this.resetStartTimeMsec), // TODO: timescale
-        $rand: (o: number) => (Math.random() * (65536 * 65536)) | 0,
-        $readmem: (o: number, a: number, b: number) => this.$readmem(a, b),
-      },
-    };
-  }
-
-  private $readmem(p_filename: number, p_rom: number) {
-    var fn = '';
-    for (var i = 0; i < 255; i++) {
-      var charCode = this.data8[p_filename + i];
-      if (charCode == 0) break;
-      fn = String.fromCharCode(charCode) + fn;
-    }
-    var filedata = this.getFileData && this.getFileData(fn);
-    if (filedata == null) throw new HDLError(fn, `no file "${fn}" for $readmem`);
-    if (typeof filedata !== 'string')
-      throw new HDLError(fn, `file "${fn}" must be lines of hex or binary values`);
-    var ishex = !fn.endsWith('.binary'); // TODO: hex should be attribute in xml
-    var data = filedata
-      .split('\n')
-      .filter((s) => s !== '')
-      .map((s) => parseInt(s, ishex ? 16 : 2));
-    for (var i = 0; i < data.length; i++) {
-      this.data8[p_rom + i] = data[i];
-    }
-    return 0;
-  }
-
-  // create a new unique label
-  labelseq = 0;
-  private label(s?: string): string {
-    return `@${s || 'label'}_${++this.labelseq}`;
-  }
-
-  private addCopyTraceRecFunction() {
-    const m = this.bmod;
-    const o_TRACERECLEN = this.globals.lookup(TRACERECLEN).offset;
-    const o_TRACEOFS = this.globals.lookup(TRACEOFS).offset;
-    const o_TRACEEND = this.globals.lookup(TRACEEND).offset;
-    const o_TRACEBUF = this.globals.lookup(TRACEBUF).offset;
-    var i32 = binaryen.i32;
-    var none = binaryen.none;
-    var l_block = this.label('@block');
-    var l_loop = this.label('@loop');
-    m.addFunction(
-      'copyTraceRec',
-      binaryen.createType([]),
-      none,
-      [i32, i32, i32], // src, len, dest
-      m.block(l_block, [
-        // $0 = 0 (start of globals)
-        m.local.set(0, m.i32.const(GLOBALOFS)),
-        // don't use $0 as data seg offset, assume trace buffer offsets start @ 0
-        // $1 = TRACERECLEN
-        m.local.set(1, m.i32.load(0, 4, m.i32.const(o_TRACERECLEN))),
-        // $2 = TRACEOFS
-        m.local.set(2, m.i32.load(0, 4, m.i32.const(o_TRACEOFS))),
-        // while ($1--) [$0]++ = [$2]++
-        m.loop(
-          l_loop,
-          m.block(null, [
-            m.i64.store(0, 8, m.local.get(2, i32), m.i64.load(0, 8, m.local.get(0, i32))),
-            m.local.set(0, m.i32.add(m.local.get(0, i32), m.i32.const(8))),
-            m.local.set(2, m.i32.add(m.local.get(2, i32), m.i32.const(8))),
-            m.local.set(1, m.i32.sub(m.local.get(1, i32), m.i32.const(8))),
-            this.bmod.br_if(l_loop, m.local.get(1, i32)),
-          ]),
-        ),
-        // TRACEOFS += TRACERECLEN
-        m.i32.store(
-          0,
-          4,
-          m.i32.const(o_TRACEOFS),
-          m.i32.add(
-            m.i32.load(0, 4, m.i32.const(o_TRACEOFS)),
-            m.i32.load(0, 4, m.i32.const(o_TRACERECLEN)),
-          ),
-        ),
-        // break if TRACEOFS < TRACEEND
-        m.br_if(
-          l_block,
-          m.i32.lt_u(
-            m.i32.load(0, 4, m.i32.const(o_TRACEOFS)),
-            m.i32.load(0, 4, m.i32.const(o_TRACEEND)),
-          ),
-        ),
-        // TRACEOFS = @TRACEBUF
-        m.i32.store(0, 4, m.i32.const(o_TRACEOFS), m.i32.const(o_TRACEBUF)),
-      ]),
-    );
-  }
-
-  private addTick2Function() {
-    const m = this.bmod;
-    var l_loop = this.label('@loop');
-    if (this.globals.lookup('clk')) {
-      var v_dseg = m.local.get(0, binaryen.i32);
-      //var v_count = m.local.get(1, binaryen.i32);
-      m.addFunction(
-        'tick2',
-        binaryen.createType([binaryen.i32, binaryen.i32]),
-        binaryen.none,
-        [],
-        m.loop(
-          l_loop,
-          m.block(null, [
-            this.makeSetVariableFunction('clk', 0),
-            m.drop(m.call('eval', [v_dseg], binaryen.i32)),
-            this.makeSetVariableFunction('clk', 1),
-            m.drop(m.call('eval', [v_dseg], binaryen.i32)),
-            // call copyTraceRec
-            m.call('copyTraceRec', [], binaryen.none),
-            // goto @loop if ($1 = $1 - 1)
-            m.br_if(
-              l_loop,
-              m.local.tee(1, m.i32.sub(m.local.get(1, binaryen.i32), m.i32.const(1)), binaryen.i32),
-            ),
-          ]),
-        ),
-      );
-      m.addFunctionExport('tick2', 'tick2');
-    } else {
-      m.addFunctionExport('eval', 'tick2');
-    }
-  }
-
-  private addEvalFunction() {
-    this.bmod.addFunction(
-      'eval',
-      binaryen.createType([binaryen.i32]),
-      binaryen.i32,
-      [],
-      this.makeTickFuncBody(0),
-    );
-    this.bmod.addFunctionExport('eval', 'eval');
-  }
-
-  private makeGetVariableFunction(name: string, value: number) {
-    var dtype = this.globals.lookup(name).type!;
-    var src: HDLVarRef = { refname: name, dtype: dtype };
-    return this.e2w(src);
-  }
-
-  private makeSetVariableFunction(name: string, value: number) {
-    var dtype = this.globals.lookup(name).type!;
-    var dest: HDLVarRef = { refname: name, dtype: dtype };
-    var src: HDLConstant = { cvalue: value, bigvalue: null!, dtype: dtype! };
-    return this.assign2wasm(dest, src);
-  }
-
-  private makeTickFuncBody(count: number): number {
-    var dseg = this.bmod.local.get(0, binaryen.i32);
-    if (count > this.maxEvalIterations) return this.bmod.i32.const(count);
-    return this.bmod.block(
-      null,
-      [
-        this.bmod.call('_eval', [dseg], binaryen.none),
-        this.bmod.return(this.bmod.local.get(0, binaryen.i32)),
-        /*this.bmod.if(
-          this.bmod.call('_eval_phase__stl', [dseg], binaryen.i32),
-          this.makeTickFuncBody(count + 1),
-          this.bmod.return(this.bmod.local.get(0, binaryen.i32)),
-        ),*/
-      ],
-      binaryen.i32,
-    );
-  }
-
-  private funcResultExpr(e: HDLExpr): any {
-    // Similar to e2w, but for searching the result if exists
-    if (e == null) {
-      return binaryen.none;
-    } else if (isBlock(e)) {
-      return this.funcResult(e);
-    } else if (isWhileop(e)) {
-      return this.funcResultExpr(e.body);
-    } else if (
-      isVarDecl(e) ||
-      isVarRef(e) ||
-      isConstExpr(e) ||
-      isBigConstExpr(e) ||
-      isBinop(e) ||
-      isTriop(e) ||
-      isFuncCall(e)
-    ) {
-      return binaryen.none;
-    } else if (isUnop(e)) {
-      if (e.op == 'creturn') return binaryen.i32;
-      return binaryen.none;
-    } else {
-      throw new HDLError(e, `could not determine for funcResultExpr expr`);
-    }
-  }
-
-  private funcResult(func: HDLBlock) {
-    if (func.name) {
-      /*if (func.name.startsWith('_eval_phase__stl')) return binaryen.i32;
-      else */ if (func.name == '$time') return binaryen.i64;
-      else if (func.name == '$rand') return binaryen.i32;
-    }
-    let ret = binaryen.none;
-    for (const e of func.exprs) {
-      const res = this.funcResultExpr(e);
-      if (res != binaryen.none) {
-        ret = res;
-        return ret; // NOTE: No idea if ts actually returns the "for" or the "function"
-      }
-    }
-    return ret;
-  }
-  private funcResultByName(e: HDLFuncCall) {
-    for (var block of this.hdlmod.blocks) {
-      if (e.funcname == block.name) {
-        return this.funcResult(block);
-      }
-    }
-    throw new HDLError(e, `The function ${e.funcname} does not exist`);
-    return binaryen.none;
-  }
-
-  private pushScope(scope: Struct) {
-    scope.parent = this.locals;
-    this.locals = scope;
-  }
-
-  private popScope() {
-    this.locals = this.locals.parent;
-  }
-
-  private i3264(dt: HDLDataType) {
-    var size = getDataTypeSize(dt);
-    var type = getBinaryenType(size);
-    if (type == binaryen.i32) return this.bmod.i32;
-    else if (type == binaryen.i64) return this.bmod.i64;
-    else throw new HDLError(dt, `data types > 64 bits not supported`);
-  }
-
-  private i3264rel(e: HDLBinop) {
-    if (hasDataType(e.left) && hasDataType(e.right)) {
-      var lsize = getDataTypeSize(e.left.dtype);
-      var rsize = getDataTypeSize(e.right.dtype);
-      if (lsize > rsize) return this.i3264(e.left.dtype);
-      else return this.i3264(e.right.dtype);
-    }
-    throw new HDLError(e, `can't ${e.op} arguments`);
-  }
-
-  private dataptr(): number {
-    return this.bmod.local.get(0, binaryen.i32); // 1st param of function == data ptr
-  }
-
-  private e2w(e: HDLExpr, opts?: Options): number {
-    if (e == null) {
-      return this.bmod.nop();
-    } else if (isBlock(e)) {
-      return this.block2wasm(e, opts);
-    } else if (isVarDecl(e)) {
-      return this.local2wasm(e, opts);
-    } else if (isVarRef(e)) {
-      return this.varref2wasm(e, opts);
-    } else if (isConstExpr(e) || isBigConstExpr(e)) {
-      return this.const2wasm(e, opts);
-    } else if (isFuncCall(e)) {
-      return this.funccall2wasm(e, opts);
-    } else if (isUnop(e) || isBinop(e) || isTriop(e) || isWhileop(e)) {
-      var n = `_${e.op}2wasm`;
-      var fn = (this as any)[n];
-      if (fn == null) {
-        throw new HDLError(e, `no such method ${n}`);
-      }
-      return (this as any)[n](e, opts);
-    } else {
-      throw new HDLError(e, `could not translate expr`);
-    }
-  }
-
-  block2wasm(e: HDLBlock, opts?: Options): number {
-    var stmts = e.exprs.map((stmt) => this.e2w(stmt));
-    var ret = opts && opts.funcblock ? this.funcResult(opts.funcblock) : binaryen.none;
-    // must have return value for _eval_phase__stl function (OBSOLETE)
-    /*if (opts && opts.funcblock && opts.funcblock.name && opts.funcblock.name.startsWith('_eval_phase__stl') ) {
-      stmts.push(this.bmod.return(this.bmod.local.get(this.locals.lookup(CHANGEDET).index, ret)));
-    }*/
-    // return block value for loop condition
-    if (opts && opts.resulttype) {
-      ret = binaryen.i32;
-    }
-    return this.bmod.block(e.name, stmts, ret);
-  }
-
-  funccall2wasm(e: HDLFuncCall, opts?: Options): number {
-    var args = [this.dataptr()];
-    for (var arg of e.args) {
-      args.push(this.e2w(arg, { funcarg: true }));
-    }
-    var internal = e.funcname;
-    if (e.funcname.startsWith('$')) {
-      if ((e.funcname == '$stop' || e.funcname == '$finish') && e.$loc) {
-        args = [this.bmod.i32.const(e.$loc.line)]; // line # of source code
-      }
-      internal += '_' + (args.length - 1);
-    }
-    var ret = this.funcResultByName(e);
-    return this.bmod.call(internal, args, ret);
-  }
-
-  const2wasm(e: HDLConstant, opts?: Options): number {
-    var size = getDataTypeSize(e.dtype);
-    //                          creset are set as const with possible array type
-    if (isLogicType(e.dtype) || isArrayType(e.dtype)) {
-      if (e.bigvalue != null) {
-        let low = e.bigvalue & BigInt(0xffffffff);
-        let high = (e.bigvalue >> BigInt(32)) & BigInt(0xffffffff);
-        return this.i3264(e.dtype).const(Number(low), Number(high));
-      } else if (size <= 4) return this.bmod.i32.const(e.cvalue | 0);
-      else if (size <= 8) return this.bmod.i64.const(e.cvalue | 0, 0);
-      else throw new HDLError(e, `constants > 64 bits not supported`);
-    } else if (e.dtype.jstype == 'string') {
-      return this.bmod.nop(); // TODO: Nothing, as strings are not supported
-    } else {
-      throw new HDLError(e, `non-logic constants not supported`);
-    }
-  }
-
-  varref2wasm(e: HDLVarRef, opts?: Options): number {
-    if (opts && opts.store) throw Error(`cannot store here`);
-    var param = this.locals && this.locals.lookparam(e.refname);
-    var local = this.locals && this.locals.lookup(e.refname);
-    var global = this.globals.lookup(e.refname);
-    if (param != null) {
-      return this.bmod.local.get(param.offset, local.itype!);
-    } else if (local != null) {
-      return this.bmod.local.get(local.index, local.itype!);
-    } else if (global != null) {
-      if ((global.size > 8 || isArrayType(e.dtype)) && opts && opts.funcarg)
-        return this.address2wasm(e); // applies to wordsel and arrays
-      else return this.loadmem(e, this.dataptr(), global.offset, global.size);
-    }
-    throw new HDLError(e, `cannot lookup variable ${e.refname}`);
-  }
-
-  local2wasm(e: HDLVariableDef, opts?: Options): number {
-    var local = this.locals.lookup(e.name);
-    //if (local == null) throw Error(`no local for ${e.name}`)
-    return this.bmod.nop(); // TODO
-  }
-
-  assign2wasm(dest: HDLExpr, src: HDLExpr): number {
-    // Check if this is a wide type assignment
-    if (hasDataType(dest) && isWideType(dest.dtype)) {
-      return this.wideAssign2wasm(dest, src);
-    }
-
-    var value = this.e2w(src);
-    if (isVarRef(dest)) {
-      var local = this.locals && this.locals.lookup(dest.refname);
-      var global = this.globals.lookup(dest.refname);
-      if (local != null) {
-        return this.bmod.local.set(local.index, value);
-      } else if (global != null) {
-        return this.storemem(dest, this.dataptr(), global.offset, global.size, value);
-      }
-    } else if (isBinop(dest)) {
-      if (
-        false /*(dest.op == 'arraysel' || dest.op == 'wordsel') && isBit(getArrayValueType(dest.left))*/
-      ) {
-        // Meaning we need to extract a single bit of the "array"
-        var elsize =
-          dest.op == 'wordsel'
-            ? getDataTypeSize(dest.dtype)
-            : getArrayElementSizeFromExpr(dest.left);
-        var array = this.address2wasm(dest.left, { resulttype: binaryen.i32 });
-        var right = this.address2wasm(dest.right, {
-          resulttype: elsize <= 4 ? binaryen.i32 : binaryen.i64,
-        });
-        if (elsize <= 4) {
-          return this.bmod.call(
-            'V1Unpacked_storebit_i32',
-            [this.dataptr(), array, right, value, this.bmod.i32.const(elsize)],
-            binaryen.none,
-          );
-        } else {
-          return this.bmod.call(
-            'V1Unpacked_storebit_i64',
-            [this.dataptr(), array, right, value],
-            binaryen.none,
-          );
-        }
-      }
-      var addr = this.address2wasm(dest);
-      var elsize =
-        dest.op == 'wordsel' ? getDataTypeSize(dest.dtype) : getArrayElementSizeFromExpr(dest.left);
-      return this.storemem(dest, addr, 0, elsize, value);
-    }
-    throw new HDLError(dest, `cannot complete assignment`);
-  }
-
-  /**
-   * Handle assignment to a wide type (> 64 bits).
-   * Wide types are stored in memory as arrays of 32-bit chunks.
-   */
-  wideAssign2wasm(dest: HDLExpr, src: HDLExpr): number {
-    if (!hasDataType(dest) || (!isLogicType(dest.dtype) && !isArrayType(dest.dtype))) {
-      throw new HDLError(dest, `wide assign requires logic type destination`);
-    }
-
-    const destDtype = dest.dtype as HDLLogicType;
-    const numChunks = getNumChunks(destDtype);
-    const destAddr = this.address2wasm(dest);
-
-    // Handle different source expression types
-    if (isVarRef(src)) {
-      // Simple copy from another wide variable
-      const srcAddr = this.address2wasm(src);
-      return this.wideMemCopy(dest, destAddr, srcAddr, numChunks);
-    } else if (isConstExpr(src) || isBigConstExpr(src)) {
-      // Store a constant
-      return this.wideConstStore(dest, destAddr, src as HDLConstant, numChunks);
-    } else if (isBinop(src)) {
-      // Handle binary operations
-      return this.wideBinop2wasm(src as HDLBinop, destAddr, numChunks);
-    } else if (isUnop(src)) {
-      // Handle unary operations
-      return this.wideUnop2wasm(src as HDLUnop, destAddr, numChunks);
-    } else if (isTriop(src)) {
-      // Handle ternary (conditional) operations: cond ? left : right
-      return this.wideTriop2wasm(src as HDLTriop, destAddr, numChunks);
-    }
-
-    throw new HDLError(src, `unsupported wide source expression type`);
-  }
-
-  /**
-   * Generate code to copy wide data from src to dest (chunk by chunk)
-   */
-  wideMemCopy(e: HDLSourceObject, destAddr: number, srcAddr: number, numChunks: number): number {
-    const stmts: number[] = [];
-    for (let i = 0; i < numChunks; i++) {
-      const offset = i * 4;
-      stmts.push(this.bmod.i32.store(offset, 4, destAddr, this.bmod.i32.load(offset, 4, srcAddr)));
-    }
-    return this.bmod.block(null, stmts);
-  }
-
-  /**
-   * Generate code to store a wide constant to dest
-   */
-  wideConstStore(
-    e: HDLSourceObject,
-    destAddr: number,
-    src: HDLConstant,
-    numChunks: number,
-  ): number {
-    const stmts: number[] = [];
-    let value = src.bigvalue ?? BigInt(src.cvalue);
-
-    for (let i = 0; i < numChunks; i++) {
-      const chunk = Number(value & 0xffffffffn);
-      value >>= 32n;
-      stmts.push(this.bmod.i32.store(i * 4, 4, destAddr, this.bmod.i32.const(chunk)));
-    }
-    return this.bmod.block(null, stmts);
-  }
-
-  /**
-   * Generate code for a wide binary operation
-   */
-  wideBinop2wasm(e: HDLBinop, destAddr: number, numChunks: number): number {
-    const op = e.op;
-
-    // Check for bitwise operations
-    if (op === 'or' || op === 'and' || op === 'xor') {
-      return this.wideBitwiseBinop(e, destAddr, numChunks, op);
-    }
-
-    // Check for arithmetic operations
-    if (op === 'add') {
-      return this.wideAdd(e, destAddr, numChunks);
-    }
-    if (op === 'sub') {
-      return this.wideSub(e, destAddr, numChunks);
-    }
-
-    // Check for shift operations
-    if (op === 'shiftl' || op === 'shiftlovr') {
-      return this.wideShiftLeft(e, destAddr, numChunks);
-    }
-    if (op === 'shiftr' || op === 'shiftrovr') {
-      return this.wideShiftRight(e, destAddr, numChunks, false);
-    }
-    if (op === 'shiftrs') {
-      return this.wideShiftRight(e, destAddr, numChunks, true);
-    }
-
-    // Check for comparison operations (these produce 1-bit result, not wide)
-    if (op === 'eq' || op === 'neq' || op === 'lt' || op === 'gt' || op === 'lte' || op === 'gte') {
-      throw new HDLError(e, `comparison operations on wide types should not reach wideBinop2wasm`);
-    }
-
-    // Multiplication and division not yet supported for wide types
-    if (
-      op === 'mul' ||
-      op === 'muls' ||
-      op === 'div' ||
-      op === 'divs' ||
-      op === 'moddiv' ||
-      op === 'moddivs'
-    ) {
-      throw new HDLError(e, `${op} operation on values > 64 bits is not yet supported`);
-    }
-
-    throw new HDLError(e, `unsupported wide binary operation: ${op}`);
-  }
-
-  /**
-   * Generate code for wide bitwise operations (or, and, xor)
-   */
-  wideBitwiseBinop(e: HDLBinop, destAddr: number, numChunks: number, op: string): number {
-    const leftAddr = this.address2wasm(e.left);
-    const rightAddr = this.address2wasm(e.right);
-
-    const stmts: number[] = [];
-    for (let i = 0; i < numChunks; i++) {
-      const offset = i * 4;
-      const leftChunk = this.bmod.i32.load(offset, 4, leftAddr);
-      const rightChunk = this.bmod.i32.load(offset, 4, rightAddr);
-
-      let result: number;
-      if (op === 'or') {
-        result = this.bmod.i32.or(leftChunk, rightChunk);
-      } else if (op === 'and') {
-        result = this.bmod.i32.and(leftChunk, rightChunk);
-      } else {
-        result = this.bmod.i32.xor(leftChunk, rightChunk);
-      }
-
-      stmts.push(this.bmod.i32.store(offset, 4, destAddr, result));
-    }
-    return this.bmod.block(null, stmts);
-  }
-
-  /**
-   * Generate code for wide addition with carry propagation
-   */
-  wideAdd(e: HDLBinop, destAddr: number, numChunks: number): number {
-    const leftAddr = this.address2wasm(e.left);
-    const rightAddr = this.address2wasm(e.right);
-
-    // We need a local for carry. Add it to the current scope.
-    const carryLocal = this.locals.addEntry('$$carry', 4, binaryen.i32);
-    const sumLocal = this.locals.addEntry('$$sum', 4, binaryen.i32);
-    const leftLocal = this.locals.addEntry('$$left', 4, binaryen.i32);
-    // Snapshot of the step-1 overflow (left+right wrapped); captured as a
-    // local before sumLocal is overwritten with sum+carry.
-    const overflow1Local = this.locals.addEntry('$$over1', 4, binaryen.i32);
-
-    const stmts: number[] = [];
-
-    // Initialize carry to 0
-    stmts.push(this.bmod.local.set(carryLocal.index, this.bmod.i32.const(0)));
-
-    for (let i = 0; i < numChunks; i++) {
-      const offset = i * 4;
-
-      // Load left chunk
-      stmts.push(this.bmod.local.set(leftLocal.index, this.bmod.i32.load(offset, 4, leftAddr)));
-
-      // sum = left + right
-      stmts.push(
-        this.bmod.local.set(
-          sumLocal.index,
-          this.bmod.i32.add(
-            this.bmod.local.get(leftLocal.index, binaryen.i32),
-            this.bmod.i32.load(offset, 4, rightAddr),
-          ),
-        ),
-      );
-
-      // Snapshot overflow1 (sum<left detected the left+right wrap) now, before
-      // sumLocal is overwritten with sum+carry. Otherwise the comparison is
-      // re-evaluated against the post-carry value and misses the case where
-      // left+right wrapped but sum+carry lands exactly at `left` (e.g.
-      // left=0xFFFFFFFF, right=0xFFFFFFFF, carry=1 produces final sum=left).
-      stmts.push(
-        this.bmod.local.set(
-          overflow1Local.index,
-          this.bmod.i32.lt_u(
-            this.bmod.local.get(sumLocal.index, binaryen.i32),
-            this.bmod.local.get(leftLocal.index, binaryen.i32),
-          ),
-        ),
-      );
-
-      // Add carry to sum
-      const sumPlusCarry = this.bmod.i32.add(
-        this.bmod.local.get(sumLocal.index, binaryen.i32),
-        this.bmod.local.get(carryLocal.index, binaryen.i32),
-      );
-      stmts.push(this.bmod.local.set(sumLocal.index, sumPlusCarry));
-
-      // Store result
-      stmts.push(
-        this.bmod.i32.store(offset, 4, destAddr, this.bmod.local.get(sumLocal.index, binaryen.i32)),
-      );
-
-      // Update carry for next iteration.
-      // new_carry = overflow1 | (sum+carry wrapped to 0)
-      //           = overflow1 | (final_sum == 0 && carry == 1)
-      if (i < numChunks - 1) {
-        const overflow2 = this.bmod.i32.and(
-          this.bmod.i32.eq(
-            this.bmod.local.get(sumLocal.index, binaryen.i32),
-            this.bmod.i32.const(0),
-          ),
-          this.bmod.local.get(carryLocal.index, binaryen.i32),
-        );
-        stmts.push(
-          this.bmod.local.set(
-            carryLocal.index,
-            this.bmod.i32.or(this.bmod.local.get(overflow1Local.index, binaryen.i32), overflow2),
-          ),
-        );
-      }
-    }
-
-    return this.bmod.block(null, stmts);
-  }
-
-  /**
-   * Generate code for wide subtraction with borrow propagation
-   */
-  wideSub(e: HDLBinop, destAddr: number, numChunks: number): number {
-    const leftAddr = this.address2wasm(e.left);
-    const rightAddr = this.address2wasm(e.right);
-
-    // We need locals for borrow and intermediate values
-    const borrowLocal = this.locals.addEntry('$$borrow', 4, binaryen.i32);
-    const diffLocal = this.locals.addEntry('$$diff', 4, binaryen.i32);
-    const leftLocal = this.locals.addEntry('$$left2', 4, binaryen.i32);
-    const rightLocal = this.locals.addEntry('$$right', 4, binaryen.i32);
-
-    const stmts: number[] = [];
-
-    // Initialize borrow to 0
-    stmts.push(this.bmod.local.set(borrowLocal.index, this.bmod.i32.const(0)));
-
-    for (let i = 0; i < numChunks; i++) {
-      const offset = i * 4;
-
-      // Load chunks
-      stmts.push(this.bmod.local.set(leftLocal.index, this.bmod.i32.load(offset, 4, leftAddr)));
-      stmts.push(this.bmod.local.set(rightLocal.index, this.bmod.i32.load(offset, 4, rightAddr)));
-
-      // diff = left - right
-      stmts.push(
-        this.bmod.local.set(
-          diffLocal.index,
-          this.bmod.i32.sub(
-            this.bmod.local.get(leftLocal.index, binaryen.i32),
-            this.bmod.local.get(rightLocal.index, binaryen.i32),
-          ),
-        ),
-      );
-
-      // Check for underflow: if left < right, there was underflow
-      const underflow1 = this.bmod.i32.lt_u(
-        this.bmod.local.get(leftLocal.index, binaryen.i32),
-        this.bmod.local.get(rightLocal.index, binaryen.i32),
-      );
-
-      // Subtract borrow from diff
-      const diffMinusBorrow = this.bmod.i32.sub(
-        this.bmod.local.get(diffLocal.index, binaryen.i32),
-        this.bmod.local.get(borrowLocal.index, binaryen.i32),
-      );
-      stmts.push(this.bmod.local.set(diffLocal.index, diffMinusBorrow));
-
-      // Store result
-      stmts.push(
-        this.bmod.i32.store(
-          offset,
-          4,
-          destAddr,
-          this.bmod.local.get(diffLocal.index, binaryen.i32),
-        ),
-      );
-
-      // Update borrow for next iteration
-      if (i < numChunks - 1) {
-        // underflow2: diff-borrow underflowed if diff was 0 and borrow was 1
-        const underflow2 = this.bmod.i32.and(
-          this.bmod.i32.eq(
-            this.bmod.i32.add(
-              this.bmod.local.get(diffLocal.index, binaryen.i32),
-              this.bmod.local.get(borrowLocal.index, binaryen.i32),
-            ),
-            this.bmod.i32.const(0),
-          ),
-          this.bmod.local.get(borrowLocal.index, binaryen.i32),
-        );
-        stmts.push(
-          this.bmod.local.set(borrowLocal.index, this.bmod.i32.or(underflow1, underflow2)),
-        );
-      }
-    }
-
-    return this.bmod.block(null, stmts);
-  }
-
-  /**
-   * Generate code for wide left shift
-   */
-  wideShiftLeft(e: HDLBinop, destAddr: number, numChunks: number): number {
-    const srcAddr = this.address2wasm(e.left);
-
-    if (isConstExpr(e.right)) {
-      return this.wideShiftLeftConst(
-        e,
-        destAddr,
-        srcAddr,
-        numChunks,
-        (e.right as HDLConstant).cvalue,
-      );
-    }
-
-    // Variable shift
-    return this.wideShiftLeftVar(e, destAddr, srcAddr, numChunks);
-  }
-
-  /**
-   * Generate code for wide left shift by a variable amount
-   */
-  wideShiftLeftVar(e: HDLBinop, destAddr: number, srcAddr: number, numChunks: number): number {
-    const shiftAmount = this.e2w(e.right);
-
-    // Allocate locals for loop variables
-    const iLocal = this.locals.addEntry('$$shl_i', 4, binaryen.i32);
-    const chunkShiftLocal = this.locals.addEntry('$$shl_chunk', 4, binaryen.i32);
-    const bitShiftLocal = this.locals.addEntry('$$shl_bit', 4, binaryen.i32);
-    const srcIdxLocal = this.locals.addEntry('$$shl_srcIdx', 4, binaryen.i32);
-    const valueLocal = this.locals.addEntry('$$shl_value', 4, binaryen.i32);
-
-    const stmts: number[] = [];
-    const l_loop = this.label('@shl_loop');
-
-    // chunkShift = shiftAmount / 32
-    stmts.push(
-      this.bmod.local.set(
-        chunkShiftLocal.index,
-        this.bmod.i32.shr_u(shiftAmount, this.bmod.i32.const(5)),
-      ),
-    );
-
-    // bitShift = shiftAmount % 32
-    stmts.push(
-      this.bmod.local.set(
-        bitShiftLocal.index,
-        this.bmod.i32.and(shiftAmount, this.bmod.i32.const(31)),
-      ),
-    );
-
-    // i = numChunks - 1 (process from MSB to LSB)
-    stmts.push(this.bmod.local.set(iLocal.index, this.bmod.i32.const(numChunks - 1)));
-
-    // Loop: while (i >= 0)
-    const loopBody: number[] = [];
-
-    // srcIdx = i - chunkShift
-    loopBody.push(
-      this.bmod.local.set(
-        srcIdxLocal.index,
-        this.bmod.i32.sub(
-          this.bmod.local.get(iLocal.index, binaryen.i32),
-          this.bmod.local.get(chunkShiftLocal.index, binaryen.i32),
-        ),
-      ),
-    );
-
-    // if (srcIdx < 0) value = 0
-    // else if (bitShift == 0) value = src[srcIdx]
-    // else value = (src[srcIdx] << bitShift) | (src[srcIdx-1] >> (32 - bitShift))
-
-    const srcIdxNegative = this.bmod.i32.lt_s(
-      this.bmod.local.get(srcIdxLocal.index, binaryen.i32),
-      this.bmod.i32.const(0),
-    );
-
-    const bitShiftZero = this.bmod.i32.eqz(this.bmod.local.get(bitShiftLocal.index, binaryen.i32));
-
-    // Load src[srcIdx] - compute dynamic address: srcAddr + srcIdx * 4
-    const srcChunkAddr = this.bmod.i32.add(
-      srcAddr,
-      this.bmod.i32.shl(
-        this.bmod.local.get(srcIdxLocal.index, binaryen.i32),
-        this.bmod.i32.const(2),
-      ),
-    );
-
-    // Load src[srcIdx - 1] - compute dynamic address
-    const srcChunkAddr2 = this.bmod.i32.add(
-      srcAddr,
-      this.bmod.i32.shl(
-        this.bmod.i32.sub(
-          this.bmod.local.get(srcIdxLocal.index, binaryen.i32),
-          this.bmod.i32.const(1),
-        ),
-        this.bmod.i32.const(2),
-      ),
-    );
-
-    // High part: src[srcIdx] << bitShift
-    const highPart = this.bmod.i32.shl(
-      this.bmod.i32.load(0, 4, srcChunkAddr),
-      this.bmod.local.get(bitShiftLocal.index, binaryen.i32),
-    );
-
-    // Low part: src[srcIdx-1] >> (32 - bitShift)
-    // But only if srcIdx > 0
-    const lowPart = this.bmod.i32.shr_u(
-      this.bmod.i32.load(0, 4, srcChunkAddr2),
-      this.bmod.i32.sub(
-        this.bmod.i32.const(32),
-        this.bmod.local.get(bitShiftLocal.index, binaryen.i32),
-      ),
-    );
-
-    // Combined value when bitShift != 0 and srcIdx > 0
-    const combinedWithLow = this.bmod.i32.or(highPart, lowPart);
-
-    // Select: if srcIdx <= 0, use just highPart (no low neighbor), else use combined
-    const srcIdxPositive = this.bmod.i32.gt_s(
-      this.bmod.local.get(srcIdxLocal.index, binaryen.i32),
-      this.bmod.i32.const(0),
-    );
-    const shiftedValue = this.bmod.select(srcIdxPositive, combinedWithLow, highPart);
-
-    // Select between shifted value and direct copy based on bitShift
-    const copyOrShift = this.bmod.select(
-      bitShiftZero,
-      this.bmod.i32.load(0, 4, srcChunkAddr),
-      shiftedValue,
-    );
-
-    // Select final value: 0 if srcIdx < 0, else copyOrShift
-    loopBody.push(
-      this.bmod.local.set(
-        valueLocal.index,
-        this.bmod.select(srcIdxNegative, this.bmod.i32.const(0), copyOrShift),
-      ),
-    );
-
-    // Store to dest[i]
-    const destChunkAddr = this.bmod.i32.add(
-      destAddr,
-      this.bmod.i32.shl(this.bmod.local.get(iLocal.index, binaryen.i32), this.bmod.i32.const(2)),
-    );
-    loopBody.push(
-      this.bmod.i32.store(0, 4, destChunkAddr, this.bmod.local.get(valueLocal.index, binaryen.i32)),
-    );
-
-    // i--
-    loopBody.push(
-      this.bmod.local.set(
-        iLocal.index,
-        this.bmod.i32.sub(this.bmod.local.get(iLocal.index, binaryen.i32), this.bmod.i32.const(1)),
-      ),
-    );
-
-    // Continue if i >= 0
-    loopBody.push(
-      this.bmod.br_if(
-        l_loop,
-        this.bmod.i32.ge_s(this.bmod.local.get(iLocal.index, binaryen.i32), this.bmod.i32.const(0)),
-      ),
-    );
-
-    stmts.push(this.bmod.loop(l_loop, this.bmod.block(null, loopBody)));
-
-    return this.bmod.block(null, stmts);
-  }
-
-  /**
-   * Generate code for wide left shift by a constant amount
-   */
-  wideShiftLeftConst(
-    e: HDLSourceObject,
-    destAddr: number,
-    srcAddr: number,
-    numChunks: number,
-    shiftAmount: number,
-  ): number {
-    const chunkShift = Math.floor(shiftAmount / 32);
-    const bitShift = shiftAmount % 32;
-
-    const stmts: number[] = [];
-
-    // Process from MSB to LSB to handle overlapping src/dest
-    for (let i = numChunks - 1; i >= 0; i--) {
-      const srcIdx = i - chunkShift;
-      const srcIdx2 = srcIdx - 1;
-      const offset = i * 4;
-
-      if (srcIdx < 0) {
-        // Below the shifted range - zero
-        stmts.push(this.bmod.i32.store(offset, 4, destAddr, this.bmod.i32.const(0)));
-      } else if (bitShift === 0) {
-        // No bit shift, just copy chunk
-        stmts.push(
-          this.bmod.i32.store(offset, 4, destAddr, this.bmod.i32.load(srcIdx * 4, 4, srcAddr)),
-        );
-      } else {
-        // Combine bits from two source chunks
-        const highPart = this.bmod.i32.shl(
-          this.bmod.i32.load(srcIdx * 4, 4, srcAddr),
-          this.bmod.i32.const(bitShift),
-        );
-
-        let value: number;
-        if (srcIdx2 >= 0) {
-          const lowPart = this.bmod.i32.shr_u(
-            this.bmod.i32.load(srcIdx2 * 4, 4, srcAddr),
-            this.bmod.i32.const(32 - bitShift),
-          );
-          value = this.bmod.i32.or(highPart, lowPart);
-        } else {
-          value = highPart;
-        }
-
-        stmts.push(this.bmod.i32.store(offset, 4, destAddr, value));
-      }
-    }
-
-    return this.bmod.block(null, stmts);
-  }
-
-  /**
-   * Generate code for wide right shift
-   */
-  wideShiftRight(e: HDLBinop, destAddr: number, numChunks: number, signed: boolean): number {
-    const srcAddr = this.address2wasm(e.left);
-
-    if (isConstExpr(e.right)) {
-      return this.wideShiftRightConst(
-        e,
-        destAddr,
-        srcAddr,
-        numChunks,
-        (e.right as HDLConstant).cvalue,
-        signed,
-      );
-    }
-
-    // Variable shift
-    return this.wideShiftRightVar(e, destAddr, srcAddr, numChunks, signed);
-  }
-
-  /**
-   * Generate code for wide right shift by a variable amount
-   */
-  wideShiftRightVar(
-    e: HDLBinop,
-    destAddr: number,
-    srcAddr: number,
-    numChunks: number,
-    signed: boolean,
-  ): number {
-    const shiftAmount = this.e2w(e.right);
-
-    // Allocate locals for loop variables
-    const iLocal = this.locals.addEntry('$$shr_i', 4, binaryen.i32);
-    const chunkShiftLocal = this.locals.addEntry('$$shr_chunk', 4, binaryen.i32);
-    const bitShiftLocal = this.locals.addEntry('$$shr_bit', 4, binaryen.i32);
-    const srcIdxLocal = this.locals.addEntry('$$shr_srcIdx', 4, binaryen.i32);
-    const valueLocal = this.locals.addEntry('$$shr_value', 4, binaryen.i32);
-    const signExtendLocal = this.locals.addEntry('$$shr_sign', 4, binaryen.i32);
-
-    const stmts: number[] = [];
-    const l_loop = this.label('@shr_loop');
-
-    // chunkShift = shiftAmount / 32
-    stmts.push(
-      this.bmod.local.set(
-        chunkShiftLocal.index,
-        this.bmod.i32.shr_u(shiftAmount, this.bmod.i32.const(5)),
-      ),
-    );
-
-    // bitShift = shiftAmount % 32
-    stmts.push(
-      this.bmod.local.set(
-        bitShiftLocal.index,
-        this.bmod.i32.and(shiftAmount, this.bmod.i32.const(31)),
-      ),
-    );
-
-    // For signed shifts, compute sign extension value (all 1s or all 0s)
-    if (signed) {
-      // signExtend = (src[numChunks-1] >> 31) - this gives 0 or -1 (0xFFFFFFFF)
-      stmts.push(
-        this.bmod.local.set(
-          signExtendLocal.index,
-          this.bmod.i32.shr_s(
-            this.bmod.i32.load((numChunks - 1) * 4, 4, srcAddr),
-            this.bmod.i32.const(31),
-          ),
-        ),
-      );
-    } else {
-      stmts.push(this.bmod.local.set(signExtendLocal.index, this.bmod.i32.const(0)));
-    }
-
-    // i = 0 (process from LSB to MSB)
-    stmts.push(this.bmod.local.set(iLocal.index, this.bmod.i32.const(0)));
-
-    // Loop: while (i < numChunks)
-    const loopBody: number[] = [];
-
-    // srcIdx = i + chunkShift
-    loopBody.push(
-      this.bmod.local.set(
-        srcIdxLocal.index,
-        this.bmod.i32.add(
-          this.bmod.local.get(iLocal.index, binaryen.i32),
-          this.bmod.local.get(chunkShiftLocal.index, binaryen.i32),
-        ),
-      ),
-    );
-
-    // if (srcIdx >= numChunks) value = signExtend
-    // else if (bitShift == 0) value = src[srcIdx]
-    // else value = (src[srcIdx] >> bitShift) | (src[srcIdx+1] << (32 - bitShift))
-
-    const srcIdxOutOfRange = this.bmod.i32.ge_s(
-      this.bmod.local.get(srcIdxLocal.index, binaryen.i32),
-      this.bmod.i32.const(numChunks),
-    );
-
-    const bitShiftZero = this.bmod.i32.eqz(this.bmod.local.get(bitShiftLocal.index, binaryen.i32));
-
-    // Load src[srcIdx] - compute dynamic address: srcAddr + srcIdx * 4
-    const srcChunkAddr = this.bmod.i32.add(
-      srcAddr,
-      this.bmod.i32.shl(
-        this.bmod.local.get(srcIdxLocal.index, binaryen.i32),
-        this.bmod.i32.const(2),
-      ),
-    );
-
-    // Load src[srcIdx + 1] - compute dynamic address
-    const srcChunkAddr2 = this.bmod.i32.add(
-      srcAddr,
-      this.bmod.i32.shl(
-        this.bmod.i32.add(
-          this.bmod.local.get(srcIdxLocal.index, binaryen.i32),
-          this.bmod.i32.const(1),
-        ),
-        this.bmod.i32.const(2),
-      ),
-    );
-
-    // Low part: src[srcIdx] >> bitShift
-    const lowPart = this.bmod.i32.shr_u(
-      this.bmod.i32.load(0, 4, srcChunkAddr),
-      this.bmod.local.get(bitShiftLocal.index, binaryen.i32),
-    );
-
-    // High part: src[srcIdx+1] << (32 - bitShift)
-    // But only if srcIdx + 1 < numChunks
-    const highPart = this.bmod.i32.shl(
-      this.bmod.i32.load(0, 4, srcChunkAddr2),
-      this.bmod.i32.sub(
-        this.bmod.i32.const(32),
-        this.bmod.local.get(bitShiftLocal.index, binaryen.i32),
-      ),
-    );
-
-    // For signed shift, high part when srcIdx+1 >= numChunks should be sign extended
-    const signedHighPart = this.bmod.i32.shl(
-      this.bmod.local.get(signExtendLocal.index, binaryen.i32),
-      this.bmod.i32.sub(
-        this.bmod.i32.const(32),
-        this.bmod.local.get(bitShiftLocal.index, binaryen.i32),
-      ),
-    );
-
-    // Combined value when bitShift != 0
-    const srcIdx2InRange = this.bmod.i32.lt_s(
-      this.bmod.i32.add(
-        this.bmod.local.get(srcIdxLocal.index, binaryen.i32),
-        this.bmod.i32.const(1),
-      ),
-      this.bmod.i32.const(numChunks),
-    );
-
-    // Select high part: from src if in range, else from sign extension
-    const selectedHighPart = this.bmod.select(srcIdx2InRange, highPart, signedHighPart);
-    const combinedWithHigh = this.bmod.i32.or(lowPart, selectedHighPart);
-
-    // Select between shifted value and direct copy based on bitShift
-    const copyOrShift = this.bmod.select(
-      bitShiftZero,
-      this.bmod.i32.load(0, 4, srcChunkAddr),
-      combinedWithHigh,
-    );
-
-    // Select final value: signExtend if srcIdx >= numChunks, else copyOrShift
-    loopBody.push(
-      this.bmod.local.set(
-        valueLocal.index,
-        this.bmod.select(
-          srcIdxOutOfRange,
-          this.bmod.local.get(signExtendLocal.index, binaryen.i32),
-          copyOrShift,
-        ),
-      ),
-    );
-
-    // Store to dest[i]
-    const destChunkAddr = this.bmod.i32.add(
-      destAddr,
-      this.bmod.i32.shl(this.bmod.local.get(iLocal.index, binaryen.i32), this.bmod.i32.const(2)),
-    );
-    loopBody.push(
-      this.bmod.i32.store(0, 4, destChunkAddr, this.bmod.local.get(valueLocal.index, binaryen.i32)),
-    );
-
-    // i++
-    loopBody.push(
-      this.bmod.local.set(
-        iLocal.index,
-        this.bmod.i32.add(this.bmod.local.get(iLocal.index, binaryen.i32), this.bmod.i32.const(1)),
-      ),
-    );
-
-    // Continue if i < numChunks
-    loopBody.push(
-      this.bmod.br_if(
-        l_loop,
-        this.bmod.i32.lt_s(
-          this.bmod.local.get(iLocal.index, binaryen.i32),
-          this.bmod.i32.const(numChunks),
-        ),
-      ),
-    );
-
-    stmts.push(this.bmod.loop(l_loop, this.bmod.block(null, loopBody)));
-
-    return this.bmod.block(null, stmts);
-  }
-
-  /**
-   * Generate code for wide right shift by a constant amount
-   */
-  wideShiftRightConst(
-    e: HDLSourceObject,
-    destAddr: number,
-    srcAddr: number,
-    numChunks: number,
-    shiftAmount: number,
-    signed: boolean,
-  ): number {
-    const chunkShift = Math.floor(shiftAmount / 32);
-    const bitShift = shiftAmount % 32;
-
-    const stmts: number[] = [];
-
-    // For signed shifts, we need to get the sign bit
-    let signExtend = this.bmod.i32.const(0);
-    if (signed) {
-      // Get sign bit from MSB of highest chunk
-      signExtend = this.bmod.i32.shr_s(
-        this.bmod.i32.load((numChunks - 1) * 4, 4, srcAddr),
-        this.bmod.i32.const(31),
-      );
-    }
-
-    // Process from LSB to MSB
-    for (let i = 0; i < numChunks; i++) {
-      const srcIdx = i + chunkShift;
-      const srcIdx2 = srcIdx + 1;
-      const offset = i * 4;
-
-      if (srcIdx >= numChunks) {
-        // Above the shifted range - zero or sign extend
-        stmts.push(this.bmod.i32.store(offset, 4, destAddr, signExtend));
-      } else if (bitShift === 0) {
-        // No bit shift, just copy chunk
-        stmts.push(
-          this.bmod.i32.store(offset, 4, destAddr, this.bmod.i32.load(srcIdx * 4, 4, srcAddr)),
-        );
-      } else {
-        // Combine bits from two source chunks
-        const lowPart = this.bmod.i32.shr_u(
-          this.bmod.i32.load(srcIdx * 4, 4, srcAddr),
-          this.bmod.i32.const(bitShift),
-        );
-
-        let value: number;
-        if (srcIdx2 < numChunks) {
-          const highPart = this.bmod.i32.shl(
-            this.bmod.i32.load(srcIdx2 * 4, 4, srcAddr),
-            this.bmod.i32.const(32 - bitShift),
-          );
-          value = this.bmod.i32.or(lowPart, highPart);
-        } else if (signed) {
-          // Sign extend for the high bits
-          const highPart = this.bmod.i32.shl(signExtend, this.bmod.i32.const(32 - bitShift));
-          value = this.bmod.i32.or(lowPart, highPart);
-        } else {
-          value = lowPart;
-        }
-
-        stmts.push(this.bmod.i32.store(offset, 4, destAddr, value));
-      }
-    }
-
-    return this.bmod.block(null, stmts);
-  }
-
-  /**
-   * Generate code for a wide unary operation
-   */
-  wideUnop2wasm(e: HDLUnop, destAddr: number, numChunks: number): number {
-    const op = e.op;
-
-    if (op === 'not') {
-      return this.wideNot(e, destAddr, numChunks);
-    }
-
-    if (op === 'negate') {
-      return this.wideNegate(e, destAddr, numChunks);
-    }
-
-    if (op === 'extend') {
-      return this.wideExtend(e as HDLExtendop, destAddr, numChunks, false);
-    }
-
-    if (op === 'extends') {
-      return this.wideExtend(e as HDLExtendop, destAddr, numChunks, true);
-    }
-
-    throw new HDLError(e, `unsupported wide unary operation: ${op}`);
-  }
-
-  /**
-   * Generate code for a wide extend / extends: writes a `numChunks`-chunk
-   * destination from a source of width `e.widthminv`. Source chunks are copied
-   * or evaluated into the low chunks; the transition chunk (when the source
-   * width is not a multiple of 32) is masked for zero-extend or sign-extended
-   * for extends; chunks beyond the source are filled with 0 or replicated sign.
-   */
-  wideExtend(e: HDLExtendop, destAddr: number, numChunks: number, signed: boolean): number {
-    const srcWidth = e.widthminv;
-    const srcNumChunks = Math.ceil(srcWidth / 32);
-    const partialBits = srcWidth % 32;
-    const stmts: number[] = [];
-
-    if (srcWidth > 64) {
-      const srcAddr = this.address2wasm(e.left);
-      const fullSrcChunks = partialBits === 0 ? srcNumChunks : srcNumChunks - 1;
-      for (let i = 0; i < fullSrcChunks; i++) {
-        stmts.push(this.bmod.i32.store(i * 4, 4, destAddr, this.bmod.i32.load(i * 4, 4, srcAddr)));
-      }
-      if (partialBits !== 0) {
-        const transIdx = srcNumChunks - 1;
-        const raw = this.bmod.i32.load(transIdx * 4, 4, srcAddr);
-        stmts.push(
-          this.bmod.i32.store(
-            transIdx * 4,
-            4,
-            destAddr,
-            this.maskTransitionChunk(raw, partialBits, signed),
-          ),
-        );
-      }
-    } else if (srcWidth <= 32) {
-      const value = this.e2w(e.left);
-      stmts.push(
-        this.bmod.i32.store(0, 4, destAddr, this.maskTransitionChunk(value, partialBits, signed)),
-      );
-    } else {
-      // 33..64-bit source: i64 split into two 32-bit chunks.
-      const value = this.e2w(e.left);
-      stmts.push(this.bmod.i32.store(0, 4, destAddr, this.bmod.i32.wrap(value)));
-      const hiRaw = this.bmod.i32.wrap(this.bmod.i64.shr_u(value, this.bmod.i64.const(32, 0)));
-      stmts.push(
-        this.bmod.i32.store(4, 4, destAddr, this.maskTransitionChunk(hiRaw, partialBits, signed)),
-      );
-    }
-
-    // Fill chunks above the source: replicate the sign bit of the top source
-    // chunk (which we just wrote) for extends, or zero for extend.
-    if (signed && numChunks > srcNumChunks) {
-      const fillLocal = this.locals.addEntry('$$extfill', 4, binaryen.i32);
-      const lastWrittenChunk = this.bmod.i32.load((srcNumChunks - 1) * 4, 4, destAddr);
-      stmts.push(
-        this.bmod.local.set(
-          fillLocal.index,
-          this.bmod.i32.shr_s(lastWrittenChunk, this.bmod.i32.const(31)),
-        ),
-      );
-      for (let i = srcNumChunks; i < numChunks; i++) {
-        stmts.push(
-          this.bmod.i32.store(
-            i * 4,
-            4,
-            destAddr,
-            this.bmod.local.get(fillLocal.index, binaryen.i32),
-          ),
-        );
-      }
-    } else {
-      for (let i = srcNumChunks; i < numChunks; i++) {
-        stmts.push(this.bmod.i32.store(i * 4, 4, destAddr, this.bmod.i32.const(0)));
-      }
-    }
-
-    return this.bmod.block(null, stmts);
-  }
-
-  /**
-   * Narrow the i32 `raw` chunk to its declared `partialBits` low bits for a
-   * wide extend, either zero-filling (mask) or sign-filling (arithmetic
-   * shift-pair) the unused high bits. A `partialBits` of 0 means the chunk is
-   * already full-width and passes through unchanged.
-   */
-  private maskTransitionChunk(raw: number, partialBits: number, signed: boolean): number {
-    if (partialBits === 0) return raw;
-    if (signed) {
-      const shift = this.bmod.i32.const(32 - partialBits);
-      return this.bmod.i32.shr_s(this.bmod.i32.shl(raw, shift), shift);
-    }
-    return this.bmod.i32.and(raw, this.bmod.i32.const(maskLowBits(partialBits)));
-  }
-
-  /**
-   * Generate code for wide bitwise NOT
-   */
-  wideNot(e: HDLUnop, destAddr: number, numChunks: number): number {
-    const srcAddr = this.address2wasm(e.left);
-
-    const stmts: number[] = [];
-    for (let i = 0; i < numChunks; i++) {
-      const offset = i * 4;
-      stmts.push(
-        this.bmod.i32.store(
-          offset,
-          4,
-          destAddr,
-          this.bmod.i32.xor(this.bmod.i32.load(offset, 4, srcAddr), this.bmod.i32.const(-1)),
-        ),
-      );
-    }
-    return this.bmod.block(null, stmts);
-  }
-
-  /**
-   * Generate code for wide negation (two's complement)
-   */
-  wideNegate(e: HDLUnop, destAddr: number, numChunks: number): number {
-    const srcAddr = this.address2wasm(e.left);
-
-    // Negation = NOT + 1
-    // We'll do this in two passes: NOT, then add 1 with carry propagation
-    const carryLocal = this.locals.addEntry('$$ncarry', 4, binaryen.i32);
-    const valLocal = this.locals.addEntry('$$nval', 4, binaryen.i32);
-
-    const stmts: number[] = [];
-
-    // Initialize carry to 1 (for the +1)
-    stmts.push(this.bmod.local.set(carryLocal.index, this.bmod.i32.const(1)));
-
-    for (let i = 0; i < numChunks; i++) {
-      const offset = i * 4;
-
-      // NOT the source chunk
-      const notted = this.bmod.i32.xor(
-        this.bmod.i32.load(offset, 4, srcAddr),
-        this.bmod.i32.const(-1),
-      );
-
-      // Add carry
-      stmts.push(
-        this.bmod.local.set(
-          valLocal.index,
-          this.bmod.i32.add(notted, this.bmod.local.get(carryLocal.index, binaryen.i32)),
-        ),
-      );
-
-      // Store result
-      stmts.push(
-        this.bmod.i32.store(offset, 4, destAddr, this.bmod.local.get(valLocal.index, binaryen.i32)),
-      );
-
-      // Update carry: carry if result is 0 and old carry was 1
-      if (i < numChunks - 1) {
-        stmts.push(
-          this.bmod.local.set(
-            carryLocal.index,
-            this.bmod.i32.and(
-              this.bmod.i32.eqz(this.bmod.local.get(valLocal.index, binaryen.i32)),
-              this.bmod.local.get(carryLocal.index, binaryen.i32),
-            ),
-          ),
-        );
-      }
-    }
-
-    return this.bmod.block(null, stmts);
-  }
-
-  /**
-   * Generate code for wide ternary (conditional) operation: cond ? left : right
-   * Evaluates condition, then copies from left or right source to destination
-   */
-  wideTriop2wasm(e: HDLTriop, destAddr: number, numChunks: number): number {
-    // Evaluate the condition (should be a 1-bit or 32-bit value)
-    const condExpr = this.e2w(e.cond);
-
-    // Get addresses for left and right operands
-    const leftAddr = this.address2wasm(e.left);
-    const rightAddr = this.address2wasm(e.right);
-
-    // Generate if-else block that copies from left or right based on condition
-    const copyFromLeft: number[] = [];
-    const copyFromRight: number[] = [];
-
-    for (let i = 0; i < numChunks; i++) {
-      const offset = i * 4;
-      copyFromLeft.push(
-        this.bmod.i32.store(offset, 4, destAddr, this.bmod.i32.load(offset, 4, leftAddr)),
-      );
-      copyFromRight.push(
-        this.bmod.i32.store(offset, 4, destAddr, this.bmod.i32.load(offset, 4, rightAddr)),
-      );
-    }
-
-    return this.bmod.if(
-      condExpr,
-      this.bmod.block(null, copyFromLeft),
-      this.bmod.block(null, copyFromRight),
-    );
-  }
-
-  tobool(e: HDLSourceObject, ptr: number, size: number) {
-    if (size <= 4) {
-      return this.bmod.i32.and(ptr, this.bmod.i32.const(1));
-    } else if (size <= 8) {
-      return this.bmod.i64.and(ptr, this.bmod.i64.const(1, 0));
-    } else {
-      throw new HDLError(e, `cannot subbit ${size} bytes (> 64 bits not supported)`);
-    }
-  }
-
-  putbit(ptr: number, offset: number, size: number, value: number): number {
-    if (size <= 4) {
-      // 1. Shift the 1-bit value to the target offset
-      const shiftedVal = this.bmod.i32.shl(
-        this.bmod.i32.and(value, this.bmod.i32.const(1)), // Ensure value is only 1 bit
-        this.bmod.i32.and(offset, this.bmod.i32.const(31)),
-      );
-
-      // 2. Create a mask to clear the bit: ~(1 << offset)
-      const mask = this.bmod.i32.xor(
-        this.bmod.i32.shl(
-          this.bmod.i32.const(1),
-          this.bmod.i32.and(offset, this.bmod.i32.const(31)),
-        ),
-        this.bmod.i32.const(-1), // -1 is 0xFFFFFFFF, effectively a bitwise NOT
-      );
-
-      // 3. (ptr & mask) | shiftedVal
-      return this.bmod.i32.or(this.bmod.i32.and(ptr, mask), shiftedVal);
-    } else if (size <= 8) {
-      // Binaryen i64 constants require (low, high) parts
-      const offsetConst = this.bmod.i64.and(offset, this.bmod.i64.const(63, 0));
-
-      const shiftedVal = this.bmod.i64.shl(
-        this.bmod.i64.and(value, this.bmod.i64.const(1, 0)),
-        offsetConst,
-      );
-
-      const mask = this.bmod.i64.xor(
-        this.bmod.i64.shl(this.bmod.i64.const(1, 0), offsetConst),
-        this.bmod.i64.const(-1, -1), // 64-bit bitwise NOT
-      );
-
-      return this.bmod.i64.or(this.bmod.i64.and(ptr, mask), shiftedVal);
-    } else {
-      return this.bmod.nop();
-    }
-  }
-
-  subbit(ptr: number, offset: number, size: number): number {
-    if (size <= 4) {
-      return this.bmod.i32.and(
-        this.bmod.i32.shr_u(ptr, this.bmod.i32.and(offset, this.bmod.i32.const(31))),
-        this.bmod.i32.const(1),
-      );
-    } else if (size <= 8) {
-      return this.bmod.i64.and(
-        this.bmod.i64.shr_u(ptr, this.bmod.i64.and(offset, this.bmod.i64.const(63, 0))),
-        this.bmod.i64.const(1, 0),
-      );
-    } else {
-      return this.bmod.nop();
-    }
-  }
-
-  private make_V1Unpacked_loadbit_i32() {
-    const dat = this.bmod.local.get(0, binaryen.i32);
-    const array = this.bmod.local.get(1, binaryen.i32);
-    const right = this.bmod.local.get(2, binaryen.i32);
-    const elsize = this.bmod.local.get(3, binaryen.i32);
-    const index = this.bmod.local.get(4, binaryen.i32);
-    const data = this.bmod.local.get(5, binaryen.i32);
-    var block = this.bmod.block(null, [
-      this.bmod.local.set(
-        // Calc the offset
-        4, // to index
-        this.bmod.i32.add(
-          array,
-          this.bmod.i32.and(
-            right,
-            this.bmod.i32.xor(
-              this.bmod.i32.sub(elsize, this.bmod.i32.const(-1)),
-              this.bmod.i32.const(-1),
-            ),
-          ),
-        ),
-      ),
-      this.bmod.if(
-        // Obtain the raw bits
-        this.bmod.i32.eq(elsize, this.bmod.i32.const(1)),
-        this.bmod.local.set(
-          5, // to data
-          this.bmod.i32.load8_u(0, 1, index),
-        ),
-        this.bmod.if(
-          this.bmod.i32.eq(elsize, this.bmod.i32.const(2)),
-          this.bmod.local.set(
-            5, // to data
-            this.bmod.i32.load16_u(0, 2, index),
-          ),
-          this.bmod.local.set(
-            5, // to data
-            this.bmod.i32.load(0, 4, index),
-          ),
-        ),
-      ),
-      this.bmod.return(this.subbit(data, right, 4)),
-    ]);
-    this.bmod.addFunction(
-      'V1Unpacked_loadbit_i32',
-      binaryen.createType([
-        binaryen.i32, // 0 dat
-        binaryen.i32, // 1 base_addr
-        binaryen.i32, // 2 index
-        binaryen.i32, // 3 element size
-      ]),
-      binaryen.i32,
-      [
-        binaryen.i32, // 4 For calc off address
-        binaryen.i32, // 5 For data
-      ],
-      block,
-    );
-    this.bmod.addFunctionExport('V1Unpacked_loadbit_i32', 'V1Unpacked_loadbit_i32');
-  }
-
-  private make_V1Unpacked_loadbit_i64() {
-    const dat = this.bmod.local.get(0, binaryen.i32);
-    const array = this.bmod.local.get(1, binaryen.i32);
-    const right = this.bmod.local.get(2, binaryen.i64);
-    const index = this.bmod.local.get(3, binaryen.i32);
-    const data = this.bmod.local.get(4, binaryen.i64);
-    var block = this.bmod.block(null, [
-      this.bmod.local.set(
-        // Calc the offset
-        3, // to index
-        this.bmod.i32.add(
-          array,
-          this.bmod.i32.and(this.bmod.i32.wrap(right), this.bmod.i32.const(0xfffffff8)),
-        ),
-      ),
-      this.bmod.local.set(
-        // Obtain the raw bits
-        4, // to data
-        this.bmod.i64.load(0, 8, index),
-      ),
-      this.bmod.return(this.subbit(data, right, 8)),
-    ]);
-    this.bmod.addFunction(
-      'V1Unpacked_loadbit_i64',
-      binaryen.createType([
-        binaryen.i32, // 0 dat
-        binaryen.i32, // 1 base_addr
-        binaryen.i64, // 2 right
-      ]),
-      binaryen.i64,
-      [
-        binaryen.i32, // 3 For index
-        binaryen.i64, // 4 For data
-      ],
-      block,
-    );
-    this.bmod.addFunctionExport('V1Unpacked_loadbit_i64', 'V1Unpacked_loadbit_i64');
-  }
-
-  private make_V1Unpacked_storebit_i32() {
-    const dat = this.bmod.local.get(0, binaryen.i32);
-    const array = this.bmod.local.get(1, binaryen.i32);
-    const right = this.bmod.local.get(2, binaryen.i32);
-    const value = this.bmod.local.get(3, binaryen.i32);
-    const elsize = this.bmod.local.get(4, binaryen.i32);
-    const index = this.bmod.local.get(5, binaryen.i32);
-    const data = this.bmod.local.get(6, binaryen.i32);
-    var block = this.bmod.block(null, [
-      this.bmod.local.set(
-        // Calc the offset
-        5, // to index
-        this.bmod.i32.add(
-          array,
-          this.bmod.i32.and(
-            right,
-            this.bmod.i32.xor(
-              this.bmod.i32.sub(elsize, this.bmod.i32.const(-1)),
-              this.bmod.i32.const(-1),
-            ),
-          ),
-        ),
-      ),
-      this.bmod.if(
-        // Obtain the raw bits
-        this.bmod.i32.eq(elsize, this.bmod.i32.const(1)),
-        this.bmod.local.set(
-          6, // to data
-          this.bmod.i32.load8_u(0, 1, index),
-        ),
-        this.bmod.if(
-          this.bmod.i32.eq(elsize, this.bmod.i32.const(2)),
-          this.bmod.local.set(
-            6, // to data
-            this.bmod.i32.load16_u(0, 2, index),
-          ),
-          this.bmod.local.set(
-            6, // to data
-            this.bmod.i32.load(0, 4, index),
-          ),
-        ),
-      ),
-      this.bmod.local.set(
-        // Put the bit
-        6, // To data
-        this.putbit(data, right, 4, value),
-      ),
-      this.bmod.if(
-        // Put the result to bits
-        this.bmod.i32.eq(elsize, this.bmod.i32.const(1)),
-        this.bmod.i32.store8(0, 1, index, data),
-        this.bmod.if(
-          this.bmod.i32.eq(elsize, this.bmod.i32.const(2)),
-          this.bmod.i32.store16(0, 2, index, data),
-          this.bmod.i32.store(0, 4, index, data),
-        ),
-      ),
-    ]);
-    this.bmod.addFunction(
-      'V1Unpacked_storebit_i32',
-      binaryen.createType([
-        binaryen.i32, // 0 dat
-        binaryen.i32, // 1 base_addr
-        binaryen.i32, // 2 index
-        binaryen.i32, // 3 value
-        binaryen.i32, // 4 element size
-      ]),
-      binaryen.none,
-      [
-        binaryen.i32, // 5 For calc off address
-        binaryen.i32, // 6 For data
-      ],
-      block,
-    );
-    this.bmod.addFunctionExport('V1Unpacked_storebit_i32', 'V1Unpacked_storebit_i32');
-  }
-
-  private make_V1Unpacked_storebit_i64() {
-    const dat = this.bmod.local.get(0, binaryen.i32);
-    const array = this.bmod.local.get(1, binaryen.i32);
-    const right = this.bmod.local.get(2, binaryen.i64);
-    const value = this.bmod.local.get(3, binaryen.i64);
-    const index = this.bmod.local.get(4, binaryen.i32);
-    const data = this.bmod.local.get(5, binaryen.i64);
-    var block = this.bmod.block(null, [
-      this.bmod.local.set(
-        // Calc the offset
-        4, // to index
-        this.bmod.i32.add(
-          array,
-          this.bmod.i32.and(this.bmod.i32.wrap(right), this.bmod.i32.const(0xfffffff8)),
-        ),
-      ),
-      this.bmod.local.set(
-        // Obtain the raw bits
-        5, // to data
-        this.bmod.i64.load(0, 8, index),
-      ),
-      this.bmod.local.set(
-        // Put the bit
-        5, // to data
-        this.putbit(data, right, 8, value),
-      ),
-      this.bmod.i64.store(0, 8, index, data),
-    ]);
-    this.bmod.addFunction(
-      'V1Unpacked_storebit_i64',
-      binaryen.createType([
-        binaryen.i32, // 0 dat
-        binaryen.i32, // 1 base_addr
-        binaryen.i64, // 2 index
-        binaryen.i64, // 3 value
-      ]),
-      binaryen.none,
-      [
-        binaryen.i32, // 4 For calc off address
-        binaryen.i64, // 5 For data
-      ],
-      block,
-    );
-    this.bmod.addFunctionExport('V1Unpacked_storebit_i64', 'V1Unpacked_storebit_i64');
-  }
-
-  loadmem(e: HDLSourceObject, ptr: number, offset: number, size: number): number {
-    if (size == 1) {
-      return this.bmod.i32.load8_u(offset, 1, ptr);
-    } else if (size == 2) {
-      return this.bmod.i32.load16_u(offset, 2, ptr);
-    } else if (size == 4) {
-      return this.bmod.i32.load(offset, 4, ptr);
-    } else if (size == 8) {
-      return this.bmod.i64.load(offset, 8, ptr);
-    } else {
-      throw new HDLError(e, `cannot load ${size} bytes (> 64 bits not supported)`);
-    }
-  }
-
-  storemem(e: HDLSourceObject, ptr: number, offset: number, size: number, value: number): number {
-    if (size == 1) {
-      return this.bmod.i32.store8(offset, 1, ptr, value);
-    } else if (size == 2) {
-      return this.bmod.i32.store16(offset, 2, ptr, value);
-    } else if (size == 4) {
-      return this.bmod.i32.store(offset, 4, ptr, value);
-    } else if (size == 8) {
-      return this.bmod.i64.store(offset, 8, ptr, value);
-    } else {
-      throw new HDLError(e, `cannot store ${size} bytes (> 64 bits not supported)`);
-    }
-  }
-
-  address2wasm(e: HDLExpr, opts: Options = {}): number {
-    if (isBinop(e) && (e.op == 'arraysel' || e.op == 'wordsel')) {
-      var elsize =
-        e.op == 'wordsel' ? getDataTypeSize(e.dtype) : getArrayElementSizeFromExpr(e.left);
-      var array = this.address2wasm(e.left, { resulttype: binaryen.i32 });
-      var index = this.e2w(e.right);
-      return this.bmod.i32.add(array, this.bmod.i32.mul(this.bmod.i32.const(elsize), index));
-    } else if (isVarRef(e)) {
-      var local = this.locals && this.locals.lookup(e.refname);
-      var param = this.locals && this.locals.lookparam(e.refname);
-      var global = this.globals.lookup(e.refname);
-      if (param) {
-        var orig = getBinaryenType(param.size);
-        var siz = opts && opts.resulttype ? opts.resulttype : getBinaryenType(param.size);
-        if (siz == binaryen.i64 && orig == binaryen.i32) {
-          return this.bmod.i64.extend_u(this.bmod.local.get(param.offset, orig));
-        } else if (siz == binaryen.i32 && orig == binaryen.i64) {
-          return this.bmod.i32.wrap(this.bmod.local.get(param.offset, orig));
-        }
-        return this.bmod.local.get(param.offset, siz); // ().get param.offset
-      }
-      if (local != null) {
-        var orig = getBinaryenType(local.size);
-        var siz = opts && opts.resulttype ? opts.resulttype : getBinaryenType(local.size);
-        if (siz == binaryen.i64 && orig == binaryen.i32) {
-          return this.bmod.i64.extend_u(this.bmod.local.get(local.index, orig));
-        } else if (siz == binaryen.i32 && orig == binaryen.i64) {
-          return this.bmod.i32.wrap(this.bmod.local.get(local.index, orig));
-        }
-        return this.bmod.local.get(local.index, siz); // ().get param.offset
-
-        //throw new HDLError(e, `can't get array local address yet`);
-      } else if (global != null) {
-        return this.bmod.i32.const(global.offset);
-      }
-    } else if (isConstExpr(e)) {
-      var siz = getDataTypeSize(e.dtype);
-      if (opts && opts.resulttype) {
-        if (opts.resulttype == binaryen.i64) siz = 8;
-        else siz = 4;
-      }
-      if (siz <= 4) return this.bmod.i32.const(e.cvalue);
-      else if (siz <= 8) return this.bmod.i64.const(e.cvalue, 0);
-      else throw new HDLError(e, `cannot support constants > 8 bits`);
-    }
-    throw new HDLError(e, `cannot get address`);
-  }
-
-  // TODO: array bounds
-  _arraysel2wasm(e: HDLBinop, opts: Options): number {
-    let ret: number | null = null;
-    if (
-      /*isBit(getArrayValueType(e)) && isBinop(e) && (e.op == 'arraysel' || e.op == 'wordsel')*/ false
-    ) {
-      // Meaning we need to extract a single bit of the "array"
-      var elsize =
-        e.op == 'wordsel' ? getDataTypeSize(e.dtype) : getArrayElementSizeFromExpr(e.left);
-      var array = this.address2wasm(e.left, { resulttype: binaryen.i32 });
-      var right = this.address2wasm(e.right, {
-        resulttype: elsize <= 4 ? binaryen.i32 : binaryen.i64,
-      });
-
-      if (elsize <= 4) {
-        return this.bmod.call(
-          'V1Unpacked_loadbit_i32',
-          [this.dataptr(), array, right, this.bmod.i32.const(elsize)],
-          binaryen.i32,
-        );
-      } else {
-        return this.bmod.call(
-          'V1Unpacked_loadbit_i64',
-          [this.dataptr(), array, right],
-          binaryen.i64,
-        );
-      }
-    } else {
-      var addr = this.address2wasm(e);
-      var elsize = getArrayValueSize(e);
-      ret = this.loadmem(e, addr, 0, elsize);
-    }
-    // cast to destination type, if it differs than fetch type
-    if (elsize != getDataTypeSize(e.dtype)) {
-      ret = this.castexpr(ret, getArrayValueType(e), e.dtype);
-    }
-    return ret;
-  }
-
-  _wordsel2wasm(e: HDLBinop, opts: Options): number {
-    // wordsel selects a 32-bit word from a wide value
-    // Use e.dtype size (always 32 bits) instead of source array element size
-    var addr = this.address2wasm(e);
-    var elsize = getDataTypeSize(e.dtype);
-    return this.loadmem(e, addr, 0, elsize);
-  }
-
-  _assign2wasm(e: HDLBinop, opts: Options) {
-    return this.assign2wasm(e.left, e.right);
-  }
-  _assignw2wasm(e: HDLBinop, opts: Options) {
-    return this._assign2wasm(e, opts);
-  }
-  _assignpre2wasm(e: HDLBinop, opts: Options) {
-    return this._assign2wasm(e, opts);
-  }
-  _assigndly2wasm(e: HDLBinop, opts: Options) {
-    return this._assign2wasm(e, opts);
-  }
-  _assignpost2wasm(e: HDLBinop, opts: Options) {
-    return this._assign2wasm(e, opts);
-  }
-  _contassign2wasm(e: HDLBinop, opts: Options) {
-    return this._assign2wasm(e, opts);
-  }
-
-  _if2wasm(e: HDLTriop, opts: Options) {
-    return this.bmod.if(this.condAsI32(e.cond), this.e2w(e.left), this.e2w(e.right));
-  }
-  _cond2wasm(e: HDLTriop, opts: Options) {
-    return this.bmod.select(this.condAsI32(e.cond), this.e2w(e.left), this.e2w(e.right));
-  }
-  _condbound2wasm(e: HDLTriop, opts: Options) {
-    return this.bmod.select(this.condAsI32(e.cond), this.e2w(e.left), this.e2w(e.right));
-  }
-
-  /**
-   * Evaluate an HDL condition and return an i32 suitable for `if` / `select`.
-   * If the expression's underlying type is i64, coerce to i32 via `!= 0` so
-   * that values whose only set bits are above bit 31 remain truthy.
-   */
-  private condAsI32(cond: HDLExpr): number {
-    const val = this.e2w(cond);
-    if (hasDataType(cond) && isLogicType(cond.dtype) && getDataTypeSize(cond.dtype) === 8) {
-      return this.bmod.i64.ne(val, this.bmod.i64.const(0, 0));
-    }
-    return val;
-  }
-
-  _while2wasm(e: HDLWhileOp, opts: Options) {
-    var l_block = this.label('@block');
-    var l_loop = this.label('@loop');
-    var block = [];
-    if (e.precond) {
-      // TODO: detect constant while loop condition
-      block.push(
-        this.bmod.if(
-          this.e2w(e.precond, { resulttype: binaryen.i32 }),
-          this.bmod.nop(),
-          this.bmod.br(l_block), // exit loop
-        ),
-      );
-    }
-    if (e.body) {
-      block.push(this.e2w(e.body));
-    }
-    if (e.inc) {
-      block.push(this.e2w(e.inc));
-    }
-    if (e.loopcond) {
-      // TODO: detect constant while loop condition
-      block.push(
-        this.bmod.if(
-          this.e2w(e.loopcond, { resulttype: binaryen.i32 }),
-          this.bmod.nop(),
-          this.bmod.br(l_block), // exit loop
-        ),
-      );
-    }
-    block.push(this.bmod.br(l_loop));
-    return this.bmod.loop(l_loop, this.bmod.block(l_block, block, binaryen.none));
-  }
-
-  _ccast2wasm(e: HDLUnop, opts: Options) {
-    if (hasDataType(e.left)) {
-      return this.castexpr(this.e2w(e.left), e.left.dtype, e.dtype);
-    } else throw new HDLError(e.left, `no data type for ccast`);
-  }
-
-  castexpr(val: number, tsrc: HDLDataType, tdst: HDLDataType): number {
-    if (isLogicType(tsrc) && isLogicType(tdst) && tsrc.right == 0 && tdst.right == 0) {
-      if (tsrc.left == tdst.left) {
-        return val;
-      } else if (tsrc.left > 63 || tdst.left > 63) {
-        throw new HDLError(tdst, `values > 64 bits not supported`);
-      } else if (tsrc.left <= 31 && tdst.left <= 31 && !tsrc.signed && !tdst.signed) {
-        return val;
-      } else if (tsrc.left > 31 && tdst.left > 31 && !tsrc.signed && !tdst.signed) {
-        return val;
-      } else if (tsrc.left == 7 && tdst.left == 31 && tsrc.signed && tdst.signed) {
-        return this.bmod.i32.extend8_s(val);
-      } else if (tsrc.left == 15 && tdst.left == 31 && tsrc.signed && tdst.signed) {
-        return this.bmod.i32.extend16_s(val);
-      } else if (tsrc.left <= 31 && tdst.left > 31) {
-        // 32 -> 64
-        if (tsrc.signed) return this.bmod.i64.extend_s(val);
-        else return this.bmod.i64.extend_u(val);
-      } else if (tsrc.left > 31 && tdst.left <= 31) {
-        // 64 -> 32
-        return this.bmod.i32.wrap(val);
-      } else if (tsrc.left < 31 && tdst.left == 31 && tsrc.signed) {
-        // sign extend via shift (silice case)
-        let inst = this.i3264(tdst);
-        var shift = inst.const(31 - tsrc.left, 0);
-        return inst.shr_s(inst.shl(val, shift), shift);
-      }
-      throw new HDLError(
-        [tsrc, tdst],
-        `cannot cast ${tsrc.left}/${tsrc.signed} to ${tdst.left}/${tdst.signed}`,
-      );
-    }
-    throw new HDLError([tsrc, tdst], `cannot cast`);
-  }
-
-  _creset2wasm(e: HDLUnop, opts: Options) {
-    if (isVarRef(e.left)) {
-      var glob = this.globals.lookup(e.left.refname);
-      // TODO: must be better way to tell non-randomize values
-      // set clk and reset to known values so values are reset properly
-      glob.reset = glob.name != 'clk' && glob.name != 'reset' && !glob.name.startsWith('__V');
-    }
-    // we reset values in powercycle()
-    return this.bmod.nop();
-  }
-
-  _creturn2wasm(e: HDLUnop, opts: Options) {
-    return this.bmod.return(this.e2w(e.left, opts));
-  }
-
-  _stmtexpr2wasm(e: HDLUnop, opts: Options) {
-    // Handles calls, and also
-    return this.e2w(e.left, opts);
-  }
-
-  _not2wasm(e: HDLUnop, opts: Options) {
-    var inst = this.i3264(e.dtype);
-    return inst.xor(inst.const(-1, -1), this.e2w(e.left, opts));
-  }
-
-  _negate2wasm(e: HDLUnop, opts: Options) {
-    var inst = this.i3264(e.dtype);
-    return inst.sub(inst.const(0, 0), this.e2w(e.left, opts));
-  }
-
-  _changedet2wasm(e: HDLBinop, opts: Options) {
-    var req = this.locals.lookup(CHANGEDET);
-    if (!req) throw new HDLError(e, `no changedet local`);
-    var left = this.e2w(e.left);
-    var right = this.e2w(e.right);
-    let datainst = this.i3264(hasDataType(e.left) ? e.left.dtype : e.dtype);
-    return this.bmod.block(null, [
-      // if (left != right) req = 1;
-      this.bmod.if(
-        datainst.ne(left, right),
-        this.bmod.local.set(req.index, this.bmod.i32.const(1)),
-        this.bmod.nop(),
-      ),
-      // ${this.expr2js(e.right)} = ${this.expr2js(e.left)}`
-      this.assign2wasm(e.right, e.left),
-    ]);
-  }
-
-  _extend2wasm(e: HDLExtendop, opts: Options) {
-    var value = this.e2w(e.left);
-    if (e.widthminv == 32 && e.width == 64) {
-      return this.bmod.i64.extend_u(value);
-    }
-    throw new HDLError(e, `cannot extend`);
-  }
-
-  _extends2wasm(e: HDLExtendop, opts: Options) {
-    var value = this.e2w(e.left);
-    var inst = this.i3264(e.dtype);
-    if (this.bmod.getFeatures() & binaryen.Features.SignExt) {
-      if (e.widthminv == 8) {
-        return inst.extend8_s(value);
-      } else if (e.widthminv == 16) {
-        return inst.extend16_s(value);
-      } else if (e.widthminv == 32 && e.width == 64) {
-        return this.bmod.i64.extend32_s(value);
-      }
-    }
-    // TODO: this might not work? (t_math_signed2.v)
-    var shift = inst.const(e.width - e.widthminv, 0);
-    return inst.shr_s(inst.shl(value, shift), shift);
-  }
-
-  // TODO: i32/i64
-  _redxor2wasm(e: HDLUnop) {
-    if (hasDataType(e.left)) {
-      var left = this.e2w(e.left);
-      var inst = this.i3264(e.left.dtype);
-      var rtn = inst.and(inst.const(1, 0), inst.popcnt(left)); // (num_set_bits & 1)
-      return this.castexpr(rtn, e.left.dtype, e.dtype);
-    } else throw new HDLError(e, '');
-  }
-
-  recast_binop(e: HDLBinop): [number, number, HDLDataType | null] {
-    var left = this.e2w(e.left);
-    var right = this.e2w(e.right);
-    var upcast = null;
-    // if one argument is 64 bit and one is 32 bit, upcast the latter to 64 bits
-    if (hasDataType(e.left) && hasDataType(e.right)) {
-      var lsize = getDataTypeSize(e.left.dtype);
-      var rsize = getDataTypeSize(e.right.dtype);
-      var ltype = getBinaryenType(lsize);
-      var rtype = getBinaryenType(rsize);
-      if (ltype != rtype && rsize > lsize) {
-        left = this.castexpr(left, e.left.dtype, e.right.dtype);
-        upcast = e.right.dtype;
-      } else if (ltype != rtype && lsize > rsize) {
-        right = this.castexpr(right, e.right.dtype, e.left.dtype);
-        upcast = e.left.dtype;
-      } else if (ltype != rtype)
-        throw new HDLError(e, `wrong argument sizes ${lsize} and ${rsize}`);
-    }
-    return [left, right, upcast];
-  }
-
-  binop(e: HDLBinop, f_op: (a: number, b: number) => number) {
-    var [left, right, upcast] = this.recast_binop(e);
-    var rtn = f_op(left, right);
-    // if we upcasted, and result is 32 bit, downcast to 32 bits
-    if (upcast) {
-      rtn = this.castexpr(rtn, upcast, e.dtype);
-    }
-    return rtn;
-  }
-
-  _or2wasm(e: HDLBinop) {
-    return this.binop(e, this.i3264rel(e).or);
-  }
-  _and2wasm(e: HDLBinop) {
-    return this.binop(e, this.i3264rel(e).and);
-  }
-  _logand2wasm(e: HDLBinop) {
-    // Special case where is a && instead of a &
-    var [left, right, upcast] = this.recast_binop(e);
-    left = this.i3264rel(e).ne(left, this.i3264rel(e).const(0, 0));
-    right = this.i3264rel(e).ne(right, this.i3264rel(e).const(0, 0));
-    var rtn = this.i3264rel(e).and(left, right);
-    if (upcast) {
-      rtn = this.castexpr(rtn, upcast, e.dtype);
-    }
-    return rtn;
-  }
-  _xor2wasm(e: HDLBinop) {
-    return this.binop(e, this.i3264rel(e).xor);
-  }
-  _shiftl2wasm(e: HDLBinop) {
-    return this.binop(e, this.i3264rel(e).shl);
-  }
-  _shiftlovr2wasm(e: HDLBinop) {
-    return this.binop(e, this.i3264rel(e).shl);
-  }
-  _shiftr2wasm(e: HDLBinop) {
-    return this.binop(e, this.i3264rel(e).shr_u);
-  }
-  _shiftrovr2wasm(e: HDLBinop) {
-    return this.binop(e, this.i3264rel(e).shr_u);
-  }
-  _shiftrs2wasm(e: HDLBinop) {
-    return this.binop(e, this.i3264rel(e).shr_s);
-  }
-  _add2wasm(e: HDLBinop) {
-    return this.binop(e, this.i3264rel(e).add);
-  }
-  _sub2wasm(e: HDLBinop) {
-    return this.binop(e, this.i3264rel(e).sub);
-  }
-  _mul2wasm(e: HDLBinop) {
-    return this.binop(e, this.i3264rel(e).mul);
-  }
-  _muls2wasm(e: HDLBinop) {
-    return this.binop(e, this.i3264rel(e).mul); // TODO: signed?
-  }
-  _moddiv2wasm(e: HDLBinop) {
-    return this.binop(e, this.i3264rel(e).rem_u);
-  }
-  _div2wasm(e: HDLBinop) {
-    return this.binop(e, this.i3264rel(e).div_u);
-  }
-  _moddivs2wasm(e: HDLBinop) {
-    return this.binop(e, this.i3264rel(e).rem_s);
-  }
-  _divs2wasm(e: HDLBinop) {
-    return this.binop(e, this.i3264rel(e).div_s);
-  }
-
-  relop(e: HDLBinop, f_op: (a: number, b: number) => number) {
-    return f_op(this.e2w(e.left), this.e2w(e.right));
-  }
-
-  /**
-   * Signed relational comparison with proper sign extension.
-   *
-   * Verilator may store signed values that are narrower than their container type
-   * (e.g., a 28-bit signed value in a 32-bit i32). The sign bit may not be at the
-   * MSB of the container, so we need to sign-extend before using i32.lt_s etc.
-   *
-   * We determine the effective comparison width from:
-   * 1. A constant operand's origWidth (parsed from Verilog literal, e.g. 28'sh4000)
-   * 2. The operand dtype's left+1 if narrower than the container
-   */
-  signedRelop(e: HDLBinop, f_op: (a: number, b: number) => number) {
-    let left = this.e2w(e.left);
-    let right = this.e2w(e.right);
-
-    const signWidth = this.getSignedComparisonWidth(e);
-    if (signWidth !== null) {
-      const inst = this.i3264rel(e);
-      const containerBits = hasDataType(e.left) && getDataTypeSize(e.left.dtype) <= 4 ? 32 : 64;
-      if (signWidth < containerBits) {
-        // Sign-extend both operands from signWidth to containerBits
-        const shift = inst.const(containerBits - signWidth, 0);
-        left = inst.shr_s(inst.shl(left, shift), shift);
-        right = inst.shr_s(inst.shl(right, shift), shift);
-      }
-    }
-
-    return f_op(left, right);
-  }
-
-  /**
-   * Determine the effective signed comparison width.
-   * Returns null if both operands use the full container width.
-   */
-  private getSignedComparisonWidth(e: HDLBinop): number | null {
-    let width: number | null = null;
-
-    // Check if either operand is a constant with a narrower origWidth
-    if (isConstExpr(e.left) && (e.left as HDLConstant).origWidth != null) {
-      const cst = e.left as HDLConstant;
-      if (hasDataType(cst) && isLogicType(cst.dtype) && cst.dtype.signed) {
-        width = cst.origWidth!;
-      }
-    }
-    if (isConstExpr(e.right) && (e.right as HDLConstant).origWidth != null) {
-      const cst = e.right as HDLConstant;
-      if (hasDataType(cst) && isLogicType(cst.dtype) && cst.dtype.signed) {
-        const w = cst.origWidth!;
-        if (width === null || w < width) width = w;
-      }
-    }
-
-    // Also check if the dtype left+1 is narrower than the container
-    if (width === null) {
-      if (hasDataType(e.left) && isLogicType(e.left.dtype) && e.left.dtype.signed) {
-        const dtypeWidth = e.left.dtype.left + 1;
-        const containerBits = getDataTypeSize(e.left.dtype) <= 4 ? 32 : 64;
-        if (dtypeWidth < containerBits) {
-          width = dtypeWidth;
-        }
-      }
-      if (hasDataType(e.right) && isLogicType(e.right.dtype) && e.right.dtype.signed) {
-        const dtypeWidth = e.right.dtype.left + 1;
-        const containerBits = getDataTypeSize(e.right.dtype) <= 4 ? 32 : 64;
-        if (dtypeWidth < containerBits) {
-          if (width === null || dtypeWidth < width) width = dtypeWidth;
-        }
-      }
-    }
-
-    return width;
-  }
-
-  /**
-   * Check if this is a comparison involving wide operands
-   */
-  private isWideComparison(e: HDLBinop): boolean {
-    return (
-      (hasDataType(e.left) && isWideType(e.left.dtype)) ||
-      (hasDataType(e.right) && isWideType(e.right.dtype))
-    );
-  }
-
-  _eq2wasm(e: HDLBinop) {
-    if (this.isWideComparison(e)) {
-      return this.wideEq(e);
-    }
-    return this.relop(e, this.i3264rel(e).eq);
-  }
-  _neq2wasm(e: HDLBinop) {
-    if (this.isWideComparison(e)) {
-      return this.wideNeq(e);
-    }
-    return this.relop(e, this.i3264rel(e).ne);
-  }
-  _lt2wasm(e: HDLBinop) {
-    if (this.isWideComparison(e)) {
-      return this.wideLt(e, false);
-    }
-    return this.relop(e, this.i3264rel(e).lt_u);
-  }
-  _gt2wasm(e: HDLBinop) {
-    if (this.isWideComparison(e)) {
-      return this.wideGt(e, false);
-    }
-    return this.relop(e, this.i3264rel(e).gt_u);
-  }
-  _lte2wasm(e: HDLBinop) {
-    if (this.isWideComparison(e)) {
-      return this.wideLte(e, false);
-    }
-    return this.relop(e, this.i3264rel(e).le_u);
-  }
-  _gte2wasm(e: HDLBinop) {
-    if (this.isWideComparison(e)) {
-      return this.wideGte(e, false);
-    }
-    return this.relop(e, this.i3264rel(e).ge_u);
-  }
-  _gts2wasm(e: HDLBinop) {
-    if (this.isWideComparison(e)) {
-      return this.wideGt(e, true);
-    }
-    return this.signedRelop(e, this.i3264rel(e).gt_s);
-  }
-  _lts2wasm(e: HDLBinop) {
-    if (this.isWideComparison(e)) {
-      return this.wideLt(e, true);
-    }
-    return this.signedRelop(e, this.i3264rel(e).lt_s);
-  }
-  _gtes2wasm(e: HDLBinop) {
-    if (this.isWideComparison(e)) {
-      return this.wideGte(e, true);
-    }
-    return this.signedRelop(e, this.i3264rel(e).ge_s);
-  }
-  _ltes2wasm(e: HDLBinop) {
-    if (this.isWideComparison(e)) {
-      return this.wideLte(e, true);
-    }
-    return this.signedRelop(e, this.i3264rel(e).le_s);
-  }
-
-  /**
-   * Wide equality: all chunks must be equal
-   */
-  wideEq(e: HDLBinop): number {
-    const leftDtype = hasDataType(e.left) ? e.left.dtype : null;
-    const rightDtype = hasDataType(e.right) ? e.right.dtype : null;
-    const dtype = leftDtype && isWideType(leftDtype) ? leftDtype : rightDtype;
-    if (!dtype || !isLogicType(dtype)) {
-      throw new HDLError(e, `wide comparison requires logic type`);
-    }
-
-    const numChunks = getNumChunks(dtype);
-    const leftAddr = this.address2wasm(e.left);
-    const rightAddr = this.address2wasm(e.right);
-
-    // Start with 1 (true), AND with each chunk comparison
-    let result = this.bmod.i32.const(1);
-    for (let i = 0; i < numChunks; i++) {
-      const offset = i * 4;
-      const chunkEq = this.bmod.i32.eq(
-        this.bmod.i32.load(offset, 4, leftAddr),
-        this.bmod.i32.load(offset, 4, rightAddr),
-      );
-      result = this.bmod.i32.and(result, chunkEq);
-    }
-    return result;
-  }
-
-  /**
-   * Wide inequality: any chunk different
-   */
-  wideNeq(e: HDLBinop): number {
-    const leftDtype = hasDataType(e.left) ? e.left.dtype : null;
-    const rightDtype = hasDataType(e.right) ? e.right.dtype : null;
-    const dtype = leftDtype && isWideType(leftDtype) ? leftDtype : rightDtype;
-    if (!dtype || !isLogicType(dtype)) {
-      throw new HDLError(e, `wide comparison requires logic type`);
-    }
-
-    const numChunks = getNumChunks(dtype);
-    const leftAddr = this.address2wasm(e.left);
-    const rightAddr = this.address2wasm(e.right);
-
-    // Start with 0 (false), OR with each chunk comparison
-    let result = this.bmod.i32.const(0);
-    for (let i = 0; i < numChunks; i++) {
-      const offset = i * 4;
-      const chunkNeq = this.bmod.i32.ne(
-        this.bmod.i32.load(offset, 4, leftAddr),
-        this.bmod.i32.load(offset, 4, rightAddr),
-      );
-      result = this.bmod.i32.or(result, chunkNeq);
-    }
-    return result;
-  }
-
-  /**
-   * Wide less than: compare from MSB to LSB
-   * For signed, only MSB is treated as signed
-   * Uses nested if-else to avoid WASM validation issues with returns
-   */
-  wideLt(e: HDLBinop, signed: boolean): number {
-    const leftDtype = hasDataType(e.left) ? e.left.dtype : null;
-    const rightDtype = hasDataType(e.right) ? e.right.dtype : null;
-    const dtype = leftDtype && isWideType(leftDtype) ? leftDtype : rightDtype;
-    if (!dtype || !isLogicType(dtype)) {
-      throw new HDLError(e, `wide comparison requires logic type`);
-    }
-
-    const numChunks = getNumChunks(dtype);
-    const leftAddr = this.address2wasm(e.left);
-    const rightAddr = this.address2wasm(e.right);
-
-    // Build nested if-else from LSB to MSB
-    // Start with 0 (equal case at the end returns false for strict less than)
-    let result: number = this.bmod.i32.const(0);
-
-    for (let i = 0; i < numChunks; i++) {
-      const offset = i * 4;
-      const isMsb = i === numChunks - 1;
-
-      const leftChunk = this.bmod.i32.load(offset, 4, leftAddr);
-      const rightChunk = this.bmod.i32.load(offset, 4, rightAddr);
-
-      // Compare: use signed comparison for MSB if signed, unsigned otherwise
-      const lt =
-        isMsb && signed
-          ? this.bmod.i32.lt_s(leftChunk, rightChunk)
-          : this.bmod.i32.lt_u(leftChunk, rightChunk);
-      const gt =
-        isMsb && signed
-          ? this.bmod.i32.gt_s(leftChunk, rightChunk)
-          : this.bmod.i32.gt_u(leftChunk, rightChunk);
-
-      // For this chunk: if lt -> 1, if gt -> 0, if eq -> check lower chunks (result)
-      result = this.bmod.select(
-        lt,
-        this.bmod.i32.const(1),
-        this.bmod.select(gt, this.bmod.i32.const(0), result),
-      );
-    }
-
-    return result;
-  }
-
-  /**
-   * Wide greater than: compare from MSB to LSB
-   * Uses nested select operations to avoid WASM validation issues
-   */
-  wideGt(e: HDLBinop, signed: boolean): number {
-    const leftDtype = hasDataType(e.left) ? e.left.dtype : null;
-    const rightDtype = hasDataType(e.right) ? e.right.dtype : null;
-    const dtype = leftDtype && isWideType(leftDtype) ? leftDtype : rightDtype;
-    if (!dtype || !isLogicType(dtype)) {
-      throw new HDLError(e, `wide comparison requires logic type`);
-    }
-
-    const numChunks = getNumChunks(dtype);
-    const leftAddr = this.address2wasm(e.left);
-    const rightAddr = this.address2wasm(e.right);
-
-    // Build nested select from LSB to MSB
-    // Start with 0 (equal case at the end returns false for strict greater than)
-    let result: number = this.bmod.i32.const(0);
-
-    for (let i = 0; i < numChunks; i++) {
-      const offset = i * 4;
-      const isMsb = i === numChunks - 1;
-
-      const leftChunk = this.bmod.i32.load(offset, 4, leftAddr);
-      const rightChunk = this.bmod.i32.load(offset, 4, rightAddr);
-
-      const lt =
-        isMsb && signed
-          ? this.bmod.i32.lt_s(leftChunk, rightChunk)
-          : this.bmod.i32.lt_u(leftChunk, rightChunk);
-      const gt =
-        isMsb && signed
-          ? this.bmod.i32.gt_s(leftChunk, rightChunk)
-          : this.bmod.i32.gt_u(leftChunk, rightChunk);
-
-      // For this chunk: if gt -> 1, if lt -> 0, if eq -> check lower chunks (result)
-      result = this.bmod.select(
-        gt,
-        this.bmod.i32.const(1),
-        this.bmod.select(lt, this.bmod.i32.const(0), result),
-      );
-    }
-
-    return result;
-  }
-
-  /**
-   * Wide less than or equal
-   */
-  wideLte(e: HDLBinop, signed: boolean): number {
-    // a <= b is equivalent to !(a > b)
-    return this.bmod.i32.eqz(this.wideGt(e, signed));
-  }
-
-  /**
-   * Wide greater than or equal
-   */
-  wideGte(e: HDLBinop, signed: boolean): number {
-    // a >= b is equivalent to !(a < b)
-    return this.bmod.i32.eqz(this.wideLt(e, signed));
   }
 }

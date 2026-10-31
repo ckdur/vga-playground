@@ -53,9 +53,7 @@ async function compileAndRenderFrame(sources: Record<string, string>) {
   if (!res.output) {
     throw new Error(`Compilation failed: ${res.errors.map((e) => e.message).join('\n')}`);
   }
-
-  const constpool = res.output.modules['@CONST-POOL@'] || res.output.modules['__Vconst'];
-  const mod = new HDLModuleWASM(res.output.modules['TOP'], constpool);
+  const mod = new HDLModuleWASM(res.output);
   await mod.init();
 
   resetModule(mod);
