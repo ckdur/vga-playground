@@ -22,7 +22,7 @@ export class AudioPlayer {
     this.downsampleIntFactor = Math.floor(this.downsampleFracFactor); // 4
     this.downsampleFracFactor /= this.downsampleIntFactor; // 1.088 ~~ 48_000 / 44_100
 
-    this.audioCtx.audioWorklet.addModule(new URL('/resampler.js', import.meta.url)).then(() => {
+    this.audioCtx.audioWorklet.addModule(new URL('resampler.js', document.baseURI)).then(() => {
       this.resamplerNode = new AudioWorkletNode(this.audioCtx, 'resampler');
       this.resamplerNode.connect(this.audioCtx.destination);
 
